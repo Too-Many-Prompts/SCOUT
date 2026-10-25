@@ -1,0 +1,25 @@
+# Test Oracle instance. Credentials come from .env (see .env.example).
+services:
+  oracle:
+    image: gvenzl/oracle-free:latest
+    container_name: scout-oracle-test
+    restart: unless-stopped
+    ports:
+      - "${SCOUT_TEST_DB_PORT:-1521}:1521"
+    environment:
+      ORACLE_PASSWORD: ${SCOUT_TEST_DB_PASSWORD:?set SCOUT_TEST_DB_PASSWORD in .env}
+      SCOUT_TEST_READER_PASSWORD: ${SCOUT_TEST_READER_PASSWORD:?set SCOUT_TEST_READER_PASSWORD in .env}
+    volumes:
+      # *.sh here run once, on first start of a fresh container
+      - scout-oradata:/opt/oracle/oradata
+      - ./tests/db/init:/container-entrypoint-initdb.d:ro
+      - ./tests/db/seed.sql:/seed/seed.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  scout-oradata:

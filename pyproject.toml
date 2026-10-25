@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scout"
+version = "0.1.0"
+description = "Schema-Crawling Oracle Universal Tool: search Oracle databases with unknown schema for strings"
+requires-python = ">=3.10"
+dependencies = [
+    "oracledb",
+    "textual",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "python-dotenv",
+    "textual-dev",
+]
+
+[project.scripts]
+scout = "scout.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires a live Oracle database (see tests/conftest.py)",
+]

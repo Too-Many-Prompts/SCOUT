@@ -1,0 +1,10 @@
+# Copy to defaults.txt (same folder you run scout from) to pre-fill the login prompts.
+# Format: key = value. Lines starting with # are ignored.
+# User names and passwords are never read from this file; you always type them.
+host = localhost
+port = 1521
+service_name = FREEPDB1
+# schema(s) to search, comma-separated; blank = every schema you can see
+schema =
+# worker threads (also the connection-pool size for the session)
+threads = 8

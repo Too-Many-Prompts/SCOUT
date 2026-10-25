@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Bash(sudo -n docker ps -a 2>&1)",
+      "Bash(pip3 install *)",
+      "Bash(pip3 index *)",
+      "Bash(pip3 config *)",
+      "Bash(env)",
+      "Bash(pytest -m integration -v)",
+      "Bash(python3 -m pytest -m integration -v)",
+      "Bash(pytest --version)",
+      "Bash(.venv/bin/pytest -q)"
+    ]
+  }
+}
