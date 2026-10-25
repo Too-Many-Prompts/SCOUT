@@ -107,3 +107,33 @@ def test_near_contains_by_default():
 def test_invalid_options_raise(terms, kw):
     with pytest.raises(ValueError):
         build_regex(SearchOptions(terms=terms, **kw))
+
+
+# ---- a search must contain at least one real character: a bare wildcard matches everything
+
+@pytest.mark.parametrize("term", ["*", "?", "**", "*?", "?*?", "%", "_", "%%", "_*", "*%?"])
+def test_terms_made_only_of_wildcard_characters_are_refused(term):
+    with pytest.raises(ValueError, match="wildcard"):
+        build_regex(SearchOptions(terms=(term,)))
+
+
+@pytest.mark.parametrize("terms", [("* *",), ("*", "?"), ("% _",)])
+def test_phrases_with_no_real_character_are_refused(terms):
+    with pytest.raises(ValueError, match="wildcard"):
+        build_regex(SearchOptions(terms=terms))
+
+
+def test_each_proximity_term_needs_a_real_character():
+    with pytest.raises(ValueError, match="wildcard"):
+        build_regex(SearchOptions(terms=("foo", "*"), near=3))
+    with pytest.raises(ValueError, match="wildcard"):
+        build_regex(SearchOptions(terms=("%", "foo"), near=3))
+
+
+@pytest.mark.parametrize("term", ["a*", "*a", "a?", "100%", "user_name", r"\*", r"\?", "1"])
+def test_terms_with_at_least_one_real_character_are_allowed(term):
+    build_regex(SearchOptions(terms=(term,)))  # does not raise
+
+
+def test_a_wildcard_inside_a_phrase_with_real_words_is_allowed():
+    build_regex(SearchOptions(terms=("quick * fox",)))

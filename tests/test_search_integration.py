@@ -227,6 +227,17 @@ def test_broken_table_raises_without_on_skip(reader_config):
         list(search(reader_config, opts))
 
 
-def test_whole_schema_is_searched_when_named(reader_config):
-    tables = {(m.table) for m in search(reader_config, SearchOptions(terms=("*",), schemas=("SCOUT_DOCS",)))}
-    assert tables == {"DOCUMENTS", "INDEXED_NOTES", "PLAIN_NOTES"}
+def test_whole_schema_is_searched_when_named(reader_connection):
+    from scout.search import discover_columns
+
+    cols = discover_columns(reader_connection, SearchOptions(terms=("x",), schemas=("SCOUT_DOCS",)))
+    assert {c.table for c in cols} == {"DOCUMENTS", "INDEXED_NOTES", "PLAIN_NOTES"}
+
+
+def test_bare_wildcard_is_refused_before_any_database_work():
+    from scout.config import ConnectionConfig
+
+    unreachable = ConnectionConfig(host="invalid.invalid", user="u", password="p")
+    for term in ("*", "?", "%", "_"):
+        with pytest.raises(ValueError, match="wildcard"):
+            list(search(unreachable, SearchOptions(terms=(term,))))

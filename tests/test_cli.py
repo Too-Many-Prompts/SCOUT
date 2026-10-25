@@ -174,3 +174,10 @@ def test_shell_single_quotes_keep_an_escaped_wildcard_intact(monkeypatch):
     result = runner.invoke(app, [], input="h\n1521\nme\npw\nSVC\n\nsearch 'a\\*b' 'c*'\nexit\n")
     assert result.exit_code == 0, result.output
     assert searches[0][0].terms == ("a\\*b", "c*")  # backslash survives shlex inside single quotes
+
+
+def test_bare_wildcard_is_refused_before_any_prompt():
+    for term in ("*", "?", "%"):
+        result = runner.invoke(app, ["search", term])
+        assert result.exit_code == 2, term
+        assert "wildcard" in result.output and "Username" not in result.output

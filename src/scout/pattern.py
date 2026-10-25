@@ -38,6 +38,30 @@ def _core(token: str) -> str:
     return "".join(out)
 
 
+_WILDCARD_CHARS = set("*?%_")
+
+
+def _has_real_character(token: str) -> bool:
+    """True if the token contains something other than wildcard characters (* ? % _).
+
+    An escaped wildcard (\\* or \\?) is a real, literal character."""
+    i = 0
+    while i < len(token):
+        ch = token[i]
+        if ch == "\\" and i + 1 < len(token) and token[i + 1] in "*?\\":
+            return True
+        if ch not in _WILDCARD_CHARS:
+            return True
+        i += 1
+    return False
+
+
+_WILDCARD_ONLY = (
+    "Searching for only wildcard characters (like * or ?) would match everything; "
+    "include at least one letter or digit."
+)
+
+
 def build_regex(opts: "SearchOptions") -> tuple[str, str]:
     """Return (pattern, match_param) for REGEXP_LIKE. Raises ValueError on bad input.
 
@@ -53,7 +77,10 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
             raise ValueError("--near takes exactly two terms")
         if not 1 <= opts.near <= MAX_DISTANCE:
             raise ValueError(f"--near distance must be 1..{MAX_DISTANCE}")
-        a, b = (_core(_single(t)) for t in opts.terms)
+        singles = [_single(t) for t in opts.terms]
+        if not all(_has_real_character(t) for t in singles):
+            raise ValueError(_WILDCARD_ONLY)
+        a, b = (_core(t) for t in singles)
         run_on = f"{W}*" if contains else ""
         reach = f"{W}*" if contains else ""
         gap = f"{NW}+({W}+{NW}+){{0,{opts.near - 1}}}{reach}"
@@ -64,6 +91,8 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
         tokens = " ".join(opts.terms).split()
         if not tokens:
             raise ValueError("empty search term")
+        if not any(_has_real_character(t) for t in tokens):
+            raise ValueError(_WILDCARD_ONLY)
         body = f"{NW}+".join(_core(t) for t in tokens)
         pattern = f"{lead}{body}{end}"
 

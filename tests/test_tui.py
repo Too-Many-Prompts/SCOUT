@@ -232,3 +232,17 @@ async def test_whole_word_and_near_fields_build_the_search_options(monkeypatch):
     first, second = seen
     assert (first.terms, first.whole_word, first.near) == (("quick lazy",), False, None)  # contains by default
     assert (second.terms, second.whole_word, second.near) == (("quick", "lazy"), True, 4)
+
+
+async def test_bare_wildcard_term_is_refused_in_plain_words(monkeypatch):
+    fake_login(monkeypatch)
+    from scout import search as search_core
+
+    monkeypatch.setattr(search_core, "search", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "*"
+        await pilot.click("#search")
+        await pilot.pause()
+        assert "wildcard" in str(app.query_one("#status").render())
