@@ -92,6 +92,13 @@ CREATE TABLE scout_odd.late_hit (id NUMBER, txt VARCHAR2(100));
 INSERT INTO scout_odd.late_hit
   SELECT LEVEL, CASE WHEN LEVEL = 200 THEN 'the lateneedle arrives' ELSE 'filler text row' END
     FROM dual CONNECT BY LEVEL <= 200;
+-- Oracle reserved words as table and column names: only quoting keeps the generated SQL valid.
+CREATE TABLE scout_odd."ORDER" (id NUMBER, "GROUP" VARCHAR2(100), "LEVEL" VARCHAR2(100));
+INSERT INTO scout_odd."ORDER" VALUES (1, 'reservedneedle in a group', 'plain level');
+INSERT INTO scout_odd."ORDER" VALUES (2, 'nothing here', 'reservedneedle at a level');
+CREATE TABLE scout_odd."TABLE" (id NUMBER, "COMMENT" VARCHAR2(100));
+INSERT INTO scout_odd."TABLE" VALUES (1, 'a reservedneedle comment');
+
 CREATE TABLE scout_odd.nums (n NUMBER, d DATE);
 INSERT INTO scout_odd.nums VALUES (42, DATE '2024-01-01');
 
@@ -118,6 +125,8 @@ GRANT SELECT ON scout_docs.doc_titles        TO scout_reader;
 GRANT SELECT ON scout_docs.indexed_notes     TO scout_reader;
 GRANT SELECT ON scout_docs.plain_notes       TO scout_reader;
 GRANT SELECT ON scout_odd."MixedCase Table"  TO scout_reader;
+GRANT SELECT ON scout_odd."ORDER"            TO scout_reader;
+GRANT SELECT ON scout_odd."TABLE"            TO scout_reader;
 GRANT SELECT ON scout_odd.nums               TO scout_reader;
 GRANT SELECT ON scout_odd.late_hit           TO scout_reader;
 GRANT SELECT ON scout_odd."Unicode Edge"   TO scout_reader;

@@ -69,4 +69,11 @@ BROKEN = ("SCOUT_BROKEN", "EXT_MISSING", "TXT")  # visible in the catalog, fails
 
 LATE_HIT = ("SCOUT_ODD", "LATE_HIT", "TXT")  # single hit 'lateneedle', in the last of 200 rows
 
+# tables and columns named after Oracle reserved words (ORDER, GROUP, LEVEL, TABLE, COMMENT)
+RESERVED_HITS = {
+    ("SCOUT_ODD", "ORDER", "GROUP", "reservedneedle in a group"),
+    ("SCOUT_ODD", "ORDER", "LEVEL", "reservedneedle at a level"),
+    ("SCOUT_ODD", "TABLE", "COMMENT", "a reservedneedle comment"),
+}
+
 UNICODE_EDGE = ("SCOUT_ODD", "Unicode Edge")  # columns TXT and NARROW; see seed.sql

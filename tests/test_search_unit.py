@@ -105,7 +105,7 @@ def test_filters_are_binds_not_interpolated():
     assert set(call.args[1].values()) == {"HR'; DROP", "T"}
 
 
-def _fake_pool(statements):
+def _fake_pool(statements, rows=None):
     """Pool whose connections record every SQL statement; discovery returns DISCOVERY_ROWS."""
     def make_cursor():
         cur = MagicMock()
@@ -113,7 +113,7 @@ def _fake_pool(statements):
 
         def execute(sql, *a, **kw):
             statements.append(sql)
-            cur.fetchall.return_value = DISCOVERY_ROWS if "TAB_COLUMNS" in sql else []
+            cur.fetchall.return_value = (rows or DISCOVERY_ROWS) if "TAB_COLUMNS" in sql else []
 
         cur.execute.side_effect = execute
         cur.fetchmany.return_value = []
@@ -163,6 +163,14 @@ def test_search_term_is_a_bind_variable(monkeypatch):
     list(search(ConnectionConfig(), SearchOptions(terms=(evil,), threads=1)))
     assert not any("DROP TABLE" in s for s in statements)
     assert any("DROP" in str(b.get("pat", "")) for b in binds)  # it travelled as the bind
+
+
+def test_reserved_word_identifiers_are_quoted_in_search_sql(monkeypatch):
+    statements: list[str] = []
+    rows = [("SCOUT_ODD", "ORDER", "GROUP", "VARCHAR2", 0, 100, 8)]
+    monkeypatch.setattr(db, "create_pool", lambda cfg, size: _fake_pool(statements, rows))
+    list(search(ConnectionConfig(), SearchOptions(terms=("x",), threads=1)))
+    assert any('FROM "SCOUT_ODD"."ORDER"' in s and '"GROUP"' in s for s in statements), statements
 
 
 def test_supplied_pool_is_used_and_left_open(monkeypatch):

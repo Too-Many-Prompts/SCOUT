@@ -230,6 +230,8 @@ def search(
     try:
         for m in gen:
             found.append(m)
+            if show_progress:  # wipe the unfinished progress line so the hit starts on its own line
+                typer.echo("\r\x1b[K", nl=False, err=True)
             typer.echo(f"{m.owner}.{m.table}.{m.column}\t{' '.join(m.value.split())}")
     except KeyboardInterrupt:
         token.cancel()

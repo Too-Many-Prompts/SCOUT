@@ -241,3 +241,8 @@ def test_bare_wildcard_is_refused_before_any_database_work():
     for term in ("*", "?", "%", "_"):
         with pytest.raises(ValueError, match="wildcard"):
             list(search(unreachable, SearchOptions(terms=(term,))))
+
+
+def test_reserved_word_table_and_column_names(reader_config):
+    # tables ORDER and TABLE, columns GROUP, LEVEL and COMMENT: valid only because identifiers are quoted
+    assert run(reader_config, "reservedneedle", schemas=("SCOUT_ODD",)) == ex.RESERVED_HITS
