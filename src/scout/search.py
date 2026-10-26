@@ -84,6 +84,7 @@ SkipCallback = Callable[[Column, Exception], None]  # a column that could not be
 SINGLE_SCAN_PER_TABLE = False  # read each table once for all its string columns (see _search_table)
 HEARTBEAT_SECONDS = 1.0  # progress is re-sent at least this often while a search is running
 TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})  # thick driver: call_timeout exceeded
+CANCEL_CODES = frozenset({"ORA-01013"})  # statement interrupted (our cancel(), or the user's Ctrl+C)
 PRECHECK = True  # cheap substring test before the regex; kept only if the benchmark justifies it
 SEARCHABLE_TYPES = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB")
 _DONE = object()
@@ -465,6 +466,13 @@ def search(
                             conn.call_timeout = 0  # the connection goes back to the pool
             except oracledb.DatabaseError as exc:
                 if token.cancelled:  # interrupted by cancel(): not an error
+                    return
+                if _error_code(exc) in CANCEL_CODES:
+                    # Not our doing: the Oracle client breaks running statements on Ctrl+C even when
+                    # Python never sees the signal. The user wants out, so stop everything.
+                    token.cancel()
+                    if cancel is not None:
+                        cancel.cancel()  # lets the caller report "cancelled"
                     return
                 if on_skip is None:
                     raise

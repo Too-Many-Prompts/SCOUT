@@ -284,3 +284,26 @@ def test_cancel_stops_server_side_work(reader_config, admin_connection):
                 return
             time.sleep(0.1)
     pytest.fail("a SCOUT_READER session is still running a statement after cancel()")
+
+
+def test_an_interrupt_we_did_not_cause_stops_the_whole_search(monkeypatch):
+    """The Oracle client reacts to Ctrl+C by breaking running statements (ORA-01013) even when
+    Python never sees the signal. That means 'the user wants out': no skips, nothing more starts,
+    and the caller's token reports it so the front end can say 'Cancelled'."""
+    started = []
+
+    def interrupted(cur, conn):
+        started.append("C1")
+        raise oracledb.OperationalError("ORA-01013: user requested cancel of current operation")
+
+    def later(cur, conn):
+        started.append("later")
+        return []
+
+    cols = [("S", f"T{i}", "C", 100, 10) for i in range(30)]
+    FakeDb(cols, {"C": interrupted}).patch(monkeypatch)
+    token, skipped = CancelToken(), []
+    got = list(search(CFG, opts(threads=1), on_skip=lambda c, e: skipped.append(c), cancel=token))
+    assert got == [] and skipped == []
+    assert token.cancelled
+    assert len(started) < 30  # the remaining tables were never started

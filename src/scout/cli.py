@@ -236,6 +236,10 @@ def search(
         if show_progress:
             typer.echo("\r\x1b[K", nl=False, err=True)
 
+    if token.cancelled:  # the interrupt reached the database but Python never saw the signal
+        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(130)
+
     incomplete = {k for k, o in outcomes.items() if o.more_available or o.timed_out}
     labelled = opts.limit_per_column is not None or bool(incomplete)
     if csv_path:
