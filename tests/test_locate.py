@@ -72,3 +72,46 @@ def test_invalid_limit_raises_before_any_database_work(limit):
     unreachable = ConnectionConfig(host="invalid.invalid", user="u", password="p")
     with pytest.raises(ValueError, match="limit"):
         list(search(unreachable, SearchOptions(terms=("x",), limit_per_column=limit)))
+
+
+# ---- drill-down: every hit for one chosen column
+
+@pytest.fixture
+def pool(reader_config):
+    from scout import db
+
+    p = db.create_pool(reader_config, 2)
+    yield p
+    p.close(force=True)
+
+
+def test_drill_down_returns_every_hit_even_when_opts_has_a_limit(reader_config, reader_connection, pool):
+    from scout.search import drill_down, resolve_column
+
+    opts = SearchOptions(terms=("report",), schemas=ex.SCHEMAS, limit_per_column=1)
+    col = resolve_column(reader_connection, "SCOUT_HR.EMPLOYEES.NOTES", opts)
+    hits = list(drill_down(pool, col, opts))
+    complete, _ = run(reader_config, "report")
+    assert {m.key for m in hits} == {m.key for m in complete if (m.owner, m.table, m.column) == col_key(col)}
+    assert len(hits) >= 3 and all(m.rowid for m in hits)
+
+
+def test_resolve_column_handles_dots_spaces_and_case(reader_connection):
+    from scout.search import resolve_column
+
+    opts = SearchOptions(terms=("x",))
+    odd = resolve_column(reader_connection, "SCOUT_ODD.MixedCase Table.Weird Col", opts)
+    assert col_key(odd) == ex.WEIRD
+    lower = resolve_column(reader_connection, "scout_hr.employees.notes", opts)
+    assert col_key(lower) == ex.EMP_NOTES
+
+
+@pytest.mark.parametrize("ref", [
+    "SCOUT_HR.EMPLOYEES.NOPE", "SCOUT_HR.NOPE.NOTES", "NOPE.EMPLOYEES.NOTES",
+    "SCOUT_HR.EMPLOYEES.SALARY",  # a NUMBER column is never searchable
+    "EMPLOYEES.NOTES", "SCOUT_HR", "", "..",
+])
+def test_resolve_unknown_column_returns_none(reader_connection, ref):
+    from scout.search import resolve_column
+
+    assert resolve_column(reader_connection, ref, SearchOptions(terms=("x",))) is None

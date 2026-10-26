@@ -7,7 +7,7 @@ import queue
 import threading
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 import oracledb
@@ -172,6 +172,39 @@ def _search_column(
                 examples += 1
                 yield Match(col.owner, col.table, col.column, value, str(rowid))
     return ColumnOutcome(col, examples, more)
+
+
+def resolve_column(conn: oracledb.Connection, ref: str, opts: SearchOptions) -> Column | None:
+    """Find the searchable column named `OWNER.TABLE.COLUMN` (or None).
+
+    Matches against what discovery returns instead of splitting on dots, so quoted names
+    containing dots or spaces work. Exact case wins; otherwise a single case-insensitive match.
+    """
+    parts = ref.split(".")
+    for i in range(1, len(parts) - 1):  # try every dot as the owner/table boundary
+        owner, rest = ".".join(parts[:i]), ".".join(parts[i:])
+        cols = discover_columns(conn, replace(opts, schemas=(owner,), tables=()))
+        exact = [c for c in cols if f"{c.table}.{c.column}" == rest]
+        if exact:
+            return exact[0]
+        folded = [c for c in cols if f"{c.table}.{c.column}".upper() == rest.upper()]
+        if len(folded) == 1:
+            return folded[0]
+    return None
+
+
+def drill_down(pool: oracledb.ConnectionPool, column: Column, opts: SearchOptions) -> Iterator[Match]:
+    """Every hit for one column (opts.limit_per_column is ignored), streamed from one
+    borrowed read-only connection. Closing the generator stops the fetch."""
+    pattern, flags = build_regex(opts)
+    stop = threading.Event()
+    with db.acquire(pool) as conn:
+        gen = _search_column(conn, column, pattern, flags, stop, None)
+        try:
+            yield from gen
+        finally:
+            stop.set()
+            gen.close()
 
 
 def _drain(gen: Generator[Match, None, ColumnOutcome], sink: Callable[[Match], None]) -> ColumnOutcome:
