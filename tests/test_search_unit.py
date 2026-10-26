@@ -5,9 +5,10 @@ from scout import db
 from scout.config import ConnectionConfig
 from scout.search import DictionaryTier, Match, SearchOptions, discover_columns, search
 
-DISCOVERY_ROWS = [  # owner, table, column, type, text_indexed
-    ("S", "T", "A", "VARCHAR2", 0), ("S", "T", "B", "NUMBER", 0), ("S", "T", "C", "CLOB", 1),
-    ("S", "T", "D", "DATE", 0), ("S", "T", "E", "NVARCHAR2", 0), ("S", "T", "F", "CHAR", 0),
+DISCOVERY_ROWS = [  # owner, table, column, type, text_indexed, max_chars, blocks
+    ("S", "T", "A", "VARCHAR2", 0, 100, 8), ("S", "T", "B", "NUMBER", 0, None, 8),
+    ("S", "T", "C", "CLOB", 1, None, 8), ("S", "T", "D", "DATE", 0, None, 8),
+    ("S", "T", "E", "NVARCHAR2", 0, 100, 8), ("S", "T", "F", "CHAR", 0, 10, 8),
 ]
 
 
@@ -215,3 +216,23 @@ def test_open_session_validates_login_and_closes_pool_on_failure(monkeypatch):
     assert session.schemas == ("A",) and session.pool is ok
     session.close()
     ok.close.assert_called_once()
+
+
+def test_prune_columns_drops_only_columns_that_cannot_hold_a_match():
+    from scout.search import Column, prune_columns
+
+    cols = [
+        Column("S", "T", "SHORT", "VARCHAR2", max_chars=5),
+        Column("S", "T", "EXACT", "VARCHAR2", max_chars=6),
+        Column("S", "T", "LONG", "VARCHAR2", max_chars=200),
+        Column("S", "T", "LOB", "CLOB", max_chars=None),   # unknown length: never pruned
+    ]
+    kept = {c.column for c in prune_columns(cols, SearchOptions(terms=("albert",)))}
+    assert kept == {"EXACT", "LONG", "LOB"}
+
+
+def test_nothing_is_pruned_when_the_term_has_a_single_real_character():
+    from scout.search import Column, prune_columns
+
+    cols = [Column("S", "T", "TINY", "CHAR", max_chars=1)]
+    assert prune_columns(cols, SearchOptions(terms=("a*",))) == cols

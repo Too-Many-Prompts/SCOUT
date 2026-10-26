@@ -14,7 +14,7 @@ import oracledb
 
 from scout import db
 from scout.config import ConnectionConfig, default_threads
-from scout.pattern import build_regex
+from scout.pattern import build_regex, min_match_length
 
 
 class DictionaryTier(str, Enum):
@@ -43,6 +43,8 @@ class Column:
     column: str
     data_type: str
     text_indexed: bool = False  # has an Oracle Text (CONTEXT) index; informational in v1
+    max_chars: int | None = None  # declared maximum length in characters; None for LOBs/unknown
+    blocks: int | None = None  # table size in blocks (dictionary statistic; may be missing or stale)
 
 
 @dataclass(frozen=True)
@@ -117,7 +119,10 @@ def discover_columns(conn: oracledb.Connection, opts: SearchOptions) -> list[Col
                         ON i.owner = ic.index_owner AND i.index_name = ic.index_name
                       WHERE ic.table_owner = c.owner AND ic.table_name = c.table_name
                         AND ic.column_name = c.column_name AND i.ityp_name = 'CONTEXT')
-                    THEN 1 ELSE 0 END AS text_indexed
+                    THEN 1 ELSE 0 END AS text_indexed,
+               CASE WHEN c.data_type IN ('CLOB', 'NCLOB') THEN NULL
+                    ELSE NULLIF(c.char_length, 0) END AS max_chars,
+               tb.blocks
           FROM {t}_TAB_COLUMNS c
           JOIN {t}_TABLES tb ON tb.owner = c.owner AND tb.table_name = c.table_name
          WHERE c.data_type IN ({types})
@@ -132,10 +137,19 @@ def discover_columns(conn: oracledb.Connection, opts: SearchOptions) -> list[Col
         cur.execute(sql, binds)
         rows = cur.fetchall()
     return [
-        Column(owner, table, column, dtype, bool(indexed))
-        for owner, table, column, dtype, indexed in rows
+        Column(owner, table, column, dtype, bool(indexed), max_chars, blocks)
+        for owner, table, column, dtype, indexed, max_chars, blocks in rows
         if dtype in SEARCHABLE_TYPES
     ]
+
+
+def prune_columns(columns: list[Column], opts: SearchOptions) -> list[Column]:
+    """Drop columns whose declared length is shorter than the shortest possible match.
+
+    Uses declared lengths only (never statistics, which can be stale); LOB and unknown-length
+    columns are always kept."""
+    need = min_match_length(opts)
+    return [c for c in columns if c.max_chars is None or c.max_chars >= need]
 
 
 def _search_column(
@@ -252,7 +266,7 @@ def search(
     executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="scout")
     try:
         with db.acquire(pool) as conn:
-            columns = discover_columns(conn, opts)
+            columns = prune_columns(discover_columns(conn, opts), opts)
         total = len(columns)
         if on_progress:
             on_progress(0, total)

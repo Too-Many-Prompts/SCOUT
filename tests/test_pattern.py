@@ -137,3 +137,30 @@ def test_terms_with_at_least_one_real_character_are_allowed(term):
 
 def test_a_wildcard_inside_a_phrase_with_real_words_is_allowed():
     build_regex(SearchOptions(terms=("quick * fox",)))
+
+
+# ---- shortest possible match, for skipping columns too short to hold one
+
+@pytest.mark.parametrize("terms,near,expected", [
+    (("abc",), None, 3),
+    (("a*",), None, 1),
+    (("*a*b*",), None, 2),
+    (("a?c",), None, 3),
+    (("a??",), None, 3),
+    (("quick brown",), None, 11),   # two words and one separator
+    ((r"a\*",), None, 2),           # an escaped * is one literal character
+    (("ab", "cd"), 2, 5),           # two words and at least one separator
+    (("100%",), None, 4),
+])
+def test_min_match_length(terms, near, expected):
+    from scout.pattern import min_match_length
+
+    assert min_match_length(SearchOptions(terms=terms, near=near)) == expected
+
+
+def test_min_match_length_ignores_whole_word_and_case():
+    from scout.pattern import min_match_length
+
+    base = SearchOptions(terms=("Albert",))
+    assert min_match_length(base) == min_match_length(
+        SearchOptions(terms=("Albert",), whole_word=True, case_sensitive=True)) == 6

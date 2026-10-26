@@ -106,3 +106,26 @@ def _single(term: str) -> str:
     if len(tokens) != 1:
         raise ValueError("each proximity term must be a single word")
     return tokens[0]
+
+
+def _token_min_length(token: str) -> int:
+    """Characters a single word needs at minimum: * needs none, ? needs one, an escaped
+    wildcard or backslash is one literal, everything else is one."""
+    n, i = 0, 0
+    while i < len(token):
+        if token[i] == "\\" and i + 1 < len(token) and token[i + 1] in "*?\\":
+            n += 1
+            i += 1
+        elif token[i] != "*":
+            n += 1
+        i += 1
+    return n
+
+
+def min_match_length(opts: "SearchOptions") -> int:
+    """Length in characters of the shortest text that could match: a column declared shorter
+    than this cannot contain a match. Words are separated by at least one character."""
+    if opts.near is not None:
+        return sum(_token_min_length(_single(t)) for t in opts.terms) + 1
+    tokens = " ".join(opts.terms).split()
+    return sum(_token_min_length(t) for t in tokens) + max(len(tokens) - 1, 0)

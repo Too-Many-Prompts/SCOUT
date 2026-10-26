@@ -115,3 +115,62 @@ def test_resolve_unknown_column_returns_none(reader_connection, ref):
     from scout.search import resolve_column
 
     assert resolve_column(reader_connection, ref, SearchOptions(terms=("x",))) is None
+
+
+# ---- pruning: columns too short for the term are skipped; nothing with a hit may be lost
+
+BRUTE_TERMS = [
+    "a", "at", "zebra", "quick", "report", "albert", "colo?r", "colo*r", "a*", "qu*k", "fox", "the",
+    "lazy dog", "quick brown fox", "Ana Silva", "user_name", "100%", "it's a 'quoted' value",
+    "the quick brown fox jumps over the lazy dog", "Said 100% done; check user_name field",
+    "reportedly late on deliverables", "Prefers remote work; the report is due Friday",
+    "lateneedle", "zxqneedle", "Zoë Müller",
+]
+
+
+def brute_force_columns(conn, opts):
+    """Columns that really contain a hit, found with no pruning at all (direct SQL per column)."""
+    from scout.pattern import build_regex
+    from scout.search import _quote, discover_columns
+
+    pattern, flags = build_regex(opts)
+    found = set()
+    for c in discover_columns(conn, opts):
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM (SELECT 1 FROM {_quote(c.owner)}.{_quote(c.table)} "
+                f"WHERE REGEXP_LIKE({_quote(c.column)}, :p, :f) FETCH FIRST 1 ROWS ONLY)",
+                p=pattern, f=flags,
+            )
+            if cur.fetchone()[0]:
+                found.add(col_key(c))
+    return found
+
+
+@pytest.mark.parametrize("term", BRUTE_TERMS)
+def test_pruning_never_removes_a_column_with_a_hit(reader_config, reader_connection, term):
+    opts = SearchOptions(terms=(term,), schemas=ex.SCHEMAS, threads=4)
+    matches, outcomes = run(reader_config, term)
+    assert {(m.owner, m.table, m.column) for m in matches} == brute_force_columns(reader_connection, opts)
+
+
+def test_near_search_is_not_pruned_wrongly(reader_config, reader_connection):
+    opts = SearchOptions(terms=("quick", "lazy"), near=6, schemas=ex.SCHEMAS, threads=4)
+    matches = list(search(reader_config, opts))
+    assert {(m.owner, m.table, m.column) for m in matches} == brute_force_columns(reader_connection, opts)
+    assert matches
+
+
+def test_columns_shorter_than_the_term_are_not_searched(reader_config):
+    term = "x" * 60  # longer than FIRST_NAME VARCHAR2(50), shorter than NOTES VARCHAR2(400)
+    _, outcomes = run(reader_config, term)
+    searched = {col_key(o.column) for o in outcomes}
+    assert ("SCOUT_HR", "EMPLOYEES", "FIRST_NAME") not in searched
+    assert ex.EMP_NOTES in searched
+
+
+def test_clob_columns_are_never_pruned(reader_config):
+    term = "quick brown fox jumps over the lazy dog"  # 39 characters
+    matches, outcomes = run(reader_config, term)
+    assert ex.DOC_BODY in {col_key(o.column) for o in outcomes}
+    assert any((m.owner, m.table, m.column) == ex.DOC_BODY for m in matches)
