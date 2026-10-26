@@ -9,10 +9,12 @@ with unknown schema for strings. Ships both a CLI and a Textual TUI against the 
 search logic.
 
 Implemented: column discovery, pattern building, threaded search, CSV export, the CLI `search`
-command and the TUI search/export. Not implemented yet: `search.fetch_row` (fetch the whole row
+command and the TUI search/export, locate mode with drill-down, cancel, time limits and live progress
+(design: `docs/superpowers/specs/2026-10-25-locate-first-search-design.md`, plan beside it, benchmark
+results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 107 tests pass, 1 strict-xfail (`fetch_row`). The Docker compose path (`scripts/db.sh`,
+Status: 294 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -32,8 +34,37 @@ Status: 107 tests pass, 1 strict-xfail (`fetch_row`). The Docker compose path (`
 - **Scope:** only string columns (CHAR/NCHAR/VARCHAR2/NVARCHAR2/CLOB/NCLOB) of real tables.
   Views, Oracle Text `DR$` tables, nested-table storage, IOT overflow segments and
   Oracle-maintained schemas are excluded. Patterns are limited to Oracle's 512-byte regex limit.
-- **Known performance limit:** one full scan per string column (a 40-column table is read 40
-  times); one query per table OR-ing the columns would be faster.
+- **A search must contain a real character.** A term (or phrase, or either proximity term) made only
+  of `* ? % _` is refused with a plain message by `pattern.build_regex`, so the core, CLI, shell and
+  TUI all refuse it. An escaped `\*` counts as a real character.
+- **Locate mode (the default in the CLI, shell and TUI):** each column stops after 5 example hits
+  (`DEFAULT_LOCATE_LIMIT`) and is marked *more available*; `--all` (TUI: "every hit") lifts the limit.
+  `SearchOptions.limit_per_column` itself defaults to `None` (unlimited), so library callers and the
+  contract tests see complete results. Every searched column reports one `ColumnOutcome`
+  (`on_column`); `drill_down` / `resolve_column` / `--column REF` / shell `more REF` / TUI "Show all
+  hits" fetch every hit for one column. Locate-mode CSV gains a `complete` column (`no` = examples only).
+- **Time limit:** locate-mode queries get 300 s (`DEFAULT_TIME_LIMIT`; `--time-limit`). A column that
+  runs out is `ColumnOutcome.timed_out`; with no hits it also goes to `on_skip` as `ColumnTimeout`, so a
+  timeout is never presented as "no hits". `--all` and drill-down have no limit unless asked.
+- **Cancel:** `CancelToken` (`control.py`) stops a search promptly and interrupts statements already
+  running on the server (`Connection.cancel()` -> ORA-01013, swallowed). CLI/shell: Ctrl+C; TUI:
+  Cancel button or Esc. `Progress` (size-weighted fraction, in-flight tables with elapsed time, hits)
+  is sent on every finished column and at least once a second.
+- **Oracle's case-insensitive regex folds more than ASCII case** (measured): Kelvin sign = k, long s = s,
+  and one character can match several letters (sharp s = ss, ligatures = fi, ffi, ff, fl, st). Two things
+  depend on this: `pattern.min_match_length` (pruning of columns too short to hold a match) assumes up to
+  3 characters fold into 1 when case-insensitive, and `pattern.required_literal` (the substring
+  pre-check) only uses ASCII pieces free of `s` and of possible ligature pairs, tested with
+  `NLS_LOWER(col, 'NLS_SORT=BINARY')`. Both are proved by tests (a whole-BMP sweep and equivalence over the
+  seed's `Unicode Edge` table); do not loosen them without extending those tests.
+- **Speed (benchmark, 20 tables x 50k rows, 140 columns, in cache):** the regex is the cost, not the scan.
+  The pre-check is nested in `CASE WHEN INSTR(..) > 0 THEN CASE WHEN REGEXP_LIKE(..)` because Oracle does
+  not evaluate `AND` terms in order (measured): a no-hit search went from 59.5 s to 3.3 s. Single scan per
+  table (`SINGLE_SCAN_PER_TABLE`) is built and tested but OFF: no gain in cache, slower in locate mode;
+  revisit with a larger-than-memory dataset.
+- **READ ONLY snapshots:** a READ ONLY transaction cannot read an object whose definition changed within
+  the same second (ORA-01466). Test loaders wait 2 s after DDL; on a live database that is being altered,
+  an affected column simply shows up in the skipped list.
 
 ## Assumptions that shape the design
 
@@ -69,10 +100,17 @@ scripts/db.sh up|down|reset|logs   # data persists in the scout-oradata volume; 
 # or load the fixture into an already-running instance, over a normal connection:
 python -m tests.db.load_seed
 
-# run the CLI: `scout` logs in once and opens a scout> prompt (search ..., help, exit);
+# run the CLI: `scout` logs in once and opens a scout> prompt (search ..., more REF, help, exit);
 # `scout search ...` is the one-shot, scriptable form
 scout
 scout search --help
+scout search albert --column "OWNER.TABLE.COLUMN"   # every hit in one column
+scout search albert --all --csv hits.csv            # every hit everywhere (default is 5 examples/column)
+
+# benchmark (separate schema SCOUT_BENCH; the load takes about 7 minutes)
+python -m tests.bench.load --tables 20 --rows 50000
+python -m tests.bench.run --threads 8 --limit 5 [--precheck on|off] [--single-scan on|off]
+pytest -m bench
 
 # run the TUI (login screen first; Ctrl+L logs out back to it)
 python -m scout.tui
@@ -168,11 +206,13 @@ src/scout/
   pattern.py # search options -> Oracle REGEXP_LIKE pattern (pure, no DB)
   config.py  # ConnectionConfig, defaults.txt/env defaults, default thread count
   db.py      # thick-mode init, connect, session pool, Session/open_session (login once)
-  export.py  # CSV writer
+  control.py # CancelToken, Progress (shared by search and the front ends)
+  export.py  # CSV writer (optional 'complete' column for locate-mode files)
 tests/
   conftest.py        # env-driven fixtures: admin_config, reader_config, *_connection (skip if no DB)
   db/seed.sql        # synthetic multi-schema fixture; db/expected.py is its ground truth
   db/load_seed.py    # loads the seed without docker exec
+  bench/             # generated large dataset + timing runner (marker: bench, excluded by default)
   test_*.py          # unit (mocked) + integration (@pytest.mark.integration) + cli/tui
 docker-compose.yml   # test Oracle (gvenzl/oracle-free:latest)
 scripts/db.sh        # up|down|reset|logs
