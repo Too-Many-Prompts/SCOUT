@@ -120,7 +120,7 @@ async def test_search_populates_results_and_exports_csv(monkeypatch, tmp_path):
     from scout.search import Match
 
     fake = [Match("O", "T", "C", "hello\nworld"), Match("A", "T", "C", "x")]
-    monkeypatch.setattr(search_core, "search", lambda cfg, opts, progress=None, on_skip=None, pool=None: iter(fake))
+    monkeypatch.setattr(search_core, "search", lambda cfg, opts, progress=None, on_skip=None, pool=None, **kw: iter(fake))
     app = ScoutApp()
     async with app.run_test(size=(140, 40)) as pilot:
         await login(app, pilot)
@@ -133,7 +133,9 @@ async def test_search_populates_results_and_exports_csv(monkeypatch, tmp_path):
         await pilot.click("#export")
         await pilot.pause()
     lines = (tmp_path / "out.csv").read_text().splitlines()
-    assert lines[0] == "owner,table,column,value" and lines[1].startswith("A,T,C")
+    # a locate-mode export is labelled; with no cut-off column every row says complete=yes
+    assert lines[0] == "owner,table,column,value,complete" and lines[1].startswith("A,T,C")
+    assert lines[1].endswith(",yes")
 
 
 async def test_bad_term_reports_error_without_searching(monkeypatch):
@@ -246,3 +248,210 @@ async def test_bare_wildcard_term_is_refused_in_plain_words(monkeypatch):
         await pilot.click("#search")
         await pilot.pause()
         assert "wildcard" in str(app.query_one("#status").render())
+
+
+# ---- locate mode in the TUI
+
+def _col(name="A"):
+    from scout.search import Column
+
+    return Column("O", "T", name, "VARCHAR2")
+
+
+def _outcome(name="A", examples=5, more=True, timed_out=False):
+    from scout.search import ColumnOutcome
+
+    return ColumnOutcome(_col(name), examples, more, timed_out)
+
+
+def locate_fake(monkeypatch, calls=None, outcomes=(), hits=(), skips=(), hold=None, progress_event=None):
+    """Replace search_core.search; `hold` (threading.Event) keeps the fake search running."""
+    from scout import search as search_core
+
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, on_column=None, cancel=None, **kw):
+        if calls is not None:
+            calls.append({"opts": opts, "cancel": cancel})
+        if progress_event is not None:
+            progress(progress_event)
+        yield from hits
+        for o in outcomes:
+            on_column(o)
+        for col, exc in skips:
+            on_skip(col, exc)
+        if hold is not None:
+            while not hold.is_set() and not (cancel and cancel.cancelled):
+                hold.wait(0.02)
+
+    monkeypatch.setattr(search_core, "search", fake_search)
+
+
+async def test_locate_fills_the_found_table_and_flags_more_available(monkeypatch):
+    from scout.search import Match
+
+    fake_login(monkeypatch)
+    calls = []
+    locate_fake(monkeypatch, calls, outcomes=[_outcome("A", 5, True), _outcome("B", 2, False)],
+                hits=[Match("O", "T", "A", "a1"), Match("O", "T", "B", "b1")])
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        found = app.query_one("#found", DataTable)
+        rows = [tuple(str(c) for c in found.get_row_at(i)) for i in range(found.row_count)]
+        assert rows == [("O.T.A", "5", "more available"), ("O.T.B", "2", "")]
+    opts = calls[0]["opts"]
+    assert opts.limit_per_column == 5 and opts.time_limit == 300.0
+
+
+async def test_every_hit_checkbox_turns_locate_mode_off(monkeypatch):
+    fake_login(monkeypatch)
+    calls = []
+    locate_fake(monkeypatch, calls)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        app.query_one("#all_hits").value = True
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+    assert calls[0]["opts"].limit_per_column is None and calls[0]["opts"].time_limit is None
+
+
+async def test_show_all_hits_replaces_the_results_with_every_hit_for_the_selected_column(monkeypatch):
+    from scout import search as search_core
+    from scout.search import Match
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, outcomes=[_outcome("A", 5, True)], hits=[Match("O", "T", "A", "a1")])
+    drilled = []
+
+    def fake_drill(pool, column, opts, cancel=None):
+        drilled.append((column, opts))
+        for i in range(7):
+            yield Match("O", "T", "A", f"hit {i}")
+
+    monkeypatch.setattr(search_core, "drill_down", fake_drill)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#found", DataTable).move_cursor(row=0)
+        await pilot.click("#show-all")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one("#results", DataTable).row_count == 7
+        assert "O.T.A" in str(app.query_one("#status").render())
+    column, opts = drilled[0]
+    assert column.column == "A" and opts.limit_per_column is None and opts.time_limit is None
+
+
+async def test_show_all_without_a_selected_column_says_what_to_do(monkeypatch):
+    fake_login(monkeypatch)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        await pilot.click("#show-all")
+        await pilot.pause()
+        assert "Select a column" in str(app.query_one("#status").render())
+
+
+async def test_cancel_stops_the_search_and_says_so(monkeypatch):
+    import threading
+
+    fake_login(monkeypatch)
+    calls = []
+    locate_fake(monkeypatch, calls, hold=threading.Event())  # runs until cancelled
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await pilot.pause(0.2)
+        await pilot.click("#cancel")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert calls[0]["cancel"].cancelled
+        assert "Cancelled" in str(app.query_one("#status").render())
+
+
+async def test_escape_also_cancels(monkeypatch):
+    import threading
+
+    fake_login(monkeypatch)
+    calls = []
+    locate_fake(monkeypatch, calls, hold=threading.Event())
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await pilot.pause(0.2)
+        await pilot.press("escape")
+        await app.workers.wait_for_complete()
+        assert calls[0]["cancel"].cancelled
+
+
+async def test_status_shows_progress_and_the_slowest_table(monkeypatch):
+    import threading
+
+    from scout.control import Progress
+
+    fake_login(monkeypatch)
+    release = threading.Event()
+    locate_fake(monkeypatch, hold=release,
+                progress_event=Progress(3, 20, 0.35, (("S.BIG", 42.0), ("S.SMALL", 3.0)), 5, 21, 140))
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await pilot.pause(0.3)
+        text = str(app.query_one("#status").render())
+        release.set()
+        await app.workers.wait_for_complete()
+    assert "35%" in text and "S.BIG" in text and "42s" in text and "5 hits" in text
+
+
+async def test_locate_export_marks_cut_off_columns_and_says_examples_only(monkeypatch, tmp_path):
+    from scout.search import Match
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, outcomes=[_outcome("A", 5, True), _outcome("B", 1, False)],
+                hits=[Match("O", "T", "A", "a1"), Match("O", "T", "B", "b1")])
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        app.query_one("#csv_path").value = str(tmp_path / "loc.csv")
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#export")
+        await pilot.pause()
+        status = str(app.query_one("#status").render())
+    assert (tmp_path / "loc.csv").read_text().splitlines() == [
+        "owner,table,column,value,complete", "O,T,A,a1,no", "O,T,B,b1,yes"]
+    assert "examples" in status
+
+
+async def test_timed_out_columns_are_listed_as_timed_out(monkeypatch):
+    from scout.search import ColumnTimeout
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, outcomes=[_outcome("A", 0, False, timed_out=True)],
+                skips=[(_col("A"), ColumnTimeout("timed out after 300 s"))])
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        skipped = app.query_one("#skipped", DataTable)
+        assert skipped.display and "timed out" in str(skipped.get_row_at(0)[1])
