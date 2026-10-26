@@ -164,3 +164,43 @@ def test_min_match_length_ignores_whole_word_and_case():
     base = SearchOptions(terms=("Albert",))
     assert min_match_length(base) == min_match_length(
         SearchOptions(terms=("Albert",), whole_word=True, case_sensitive=True)) == 6
+
+
+# ---- Oracle's case-insensitive matching folds ligatures: one character can match two or three
+
+@pytest.mark.parametrize("term,ci,cs", [
+    ("fi", 1, 2), ("ss", 1, 2), ("ffi", 1, 3), ("ffl", 1, 3), ("st", 1, 2), ("ff", 1, 2), ("fl", 1, 2),
+    ("ffix", 2, 4), ("fifi", 2, 4), ("albert", 6, 6), ("strasse", 5, 7),
+    ("é", 1, 1), ("résumé", 2, 6),   # non-ASCII: assume the worst, 3 characters folding to 1
+])
+def test_min_match_length_allows_for_ligature_folding_when_case_insensitive(term, ci, cs):
+    from scout.pattern import min_match_length
+
+    assert min_match_length(SearchOptions(terms=(term,))) == ci
+    assert min_match_length(SearchOptions(terms=(term,), case_sensitive=True)) == cs
+
+
+# ---- the literal a cheap pre-check may require, chosen so it can never drop a true hit
+
+@pytest.mark.parametrize("terms,near,ci,cs", [
+    (("albert",), None, "albert", "albert"),
+    (("Albert",), None, "albert", "Albert"),
+    (("al*bert",), None, "bert", "bert"),
+    (("report",), None, "report", "report"),
+    (("quick",), None, "quick", "quick"),         # k is safe (Kelvin sign lowercases to k)
+    (("classic",), None, "cla", "classic"),       # s is not (long s): split around it
+    (("office",), None, None, "office"),          # ff/fi/fl/st pairs can be one ligature character
+    (("different",), None, "erent", "different"),
+    (("fine",), None, None, "fine"),
+    (("quick brown",), None, "quick", "quick"),   # longest run; ties go to the first
+    (("quick", "lazy"), 4, "quick", "quick"),
+    (("ab",), None, None, None),                  # too short to be worth a pre-check
+    (("a?c",), None, None, None),
+    (("100%",), None, "100", "100%"),             # punctuation is only safe case-sensitively
+    (("Zoë",), None, None, "Zoë"),
+])
+def test_required_literal(terms, near, ci, cs):
+    from scout.pattern import required_literal
+
+    assert required_literal(SearchOptions(terms=terms, near=near)) == ci
+    assert required_literal(SearchOptions(terms=terms, near=near, case_sensitive=True)) == cs

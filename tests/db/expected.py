@@ -68,3 +68,5 @@ ZEBRA_CONTAINS_TEXTS = ZEBRA_TEXTS | {"Zebras graze at dawn"}  # default (contai
 BROKEN = ("SCOUT_BROKEN", "EXT_MISSING", "TXT")  # visible in the catalog, fails when queried
 
 LATE_HIT = ("SCOUT_ODD", "LATE_HIT", "TXT")  # single hit 'lateneedle', in the last of 200 rows
+
+UNICODE_EDGE = ("SCOUT_ODD", "Unicode Edge")  # columns TXT and NARROW; see seed.sql

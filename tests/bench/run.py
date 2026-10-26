@@ -44,7 +44,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--limit", type=int, default=None, help="also run each variant in locate mode")
+    ap.add_argument("--precheck", choices=("on", "off"), default=None,
+                    help="force the substring pre-check on or off (default: the library setting)")
     args = ap.parse_args()
+    if args.precheck:
+        import scout.search
+
+        scout.search.PRECHECK = args.precheck == "on"
     cfg = ConnectionConfig(
         host=os.environ.get("SCOUT_TEST_DB_HOST", "localhost"),
         port=int(os.environ.get("SCOUT_TEST_DB_PORT", "1521")),

@@ -44,10 +44,10 @@ def test_more_available_flag(reader_config):
 
 
 def test_every_searched_column_gets_exactly_one_outcome(reader_config, reader_connection):
-    from scout.search import discover_columns
+    from scout.search import discover_columns, prune_columns
 
     opts = SearchOptions(terms=("report",), schemas=ex.SCHEMAS)
-    discovered = sorted(col_key(c) for c in discover_columns(reader_connection, opts))
+    discovered = sorted(col_key(c) for c in prune_columns(discover_columns(reader_connection, opts), opts))
     _, outcomes = run(reader_config, "report", limit_per_column=2)
     assert sorted(col_key(o.column) for o in outcomes) == discovered
 
@@ -174,3 +174,65 @@ def test_clob_columns_are_never_pruned(reader_config):
     matches, outcomes = run(reader_config, term)
     assert ex.DOC_BODY in {col_key(o.column) for o in outcomes}
     assert any((m.owner, m.table, m.column) == ex.DOC_BODY for m in matches)
+
+
+# ---- characters that fold to several letters must neither be pruned nor pre-checked away
+
+EDGE = ("SCOUT_ODD", "Unicode Edge")
+
+
+@pytest.mark.parametrize("term,narrow_char", [("fi", "ﬁ"), ("ffi", "ﬃ"), ("ss", "ß")])
+def test_pruning_keeps_a_one_character_column_holding_a_ligature(reader_config, term, narrow_char):
+    matches, _ = run(reader_config, term, schemas=("SCOUT_ODD",))
+    assert (*EDGE, "NARROW", narrow_char) in {m.key for m in matches}
+
+
+EDGE_TERMS = [
+    "kelvin", "sign", "safe", "strasse", "stra", "fine", "office", "ffi", "fi", "istanbul", "ss", "st",
+    "ice", "Straße", "SAFE", "k", "KELVIN", "harbour", "print", "supplies", "plain", "ascii", "lib",
+]
+
+
+def search_column_matches(conn, col, opts, with_precheck):
+    import threading
+
+    from scout.pattern import build_regex, required_literal
+    from scout.search import _search_column
+
+    pattern, flags = build_regex(opts)
+    literal = required_literal(opts) if with_precheck else None
+    gen = _search_column(conn, col, pattern, flags, threading.Event(), None, literal, not opts.case_sensitive)
+    return {m.key for m in gen}
+
+
+@pytest.mark.parametrize("case_sensitive", [False, True])
+def test_precheck_never_changes_the_result(reader_connection, case_sensitive):
+    from scout.search import discover_columns
+
+    cols = discover_columns(
+        reader_connection, SearchOptions(terms=("x",), schemas=("SCOUT_ODD", "SCOUT_HR", "SCOUT_DOCS")))
+    for term in EDGE_TERMS + BRUTE_TERMS:
+        opts = SearchOptions(terms=(term,), case_sensitive=case_sensitive)
+        for col in cols:
+            assert search_column_matches(reader_connection, col, opts, True) == \
+                search_column_matches(reader_connection, col, opts, False), (term, col)
+
+
+def test_nls_lower_never_misses_a_regex_match_for_the_safe_characters(reader_connection):
+    """Sweep the whole BMP: wherever REGEXP_LIKE(..., 'i') matches a safe literal character,
+    INSTR(NLS_LOWER(text)) must find it too. This is the proof behind _SAFE_FOLD."""
+    from scout.pattern import _SAFE_FOLD
+
+    sql = """
+        SELECT cp FROM (SELECT LEVEL + 31 AS cp FROM dual CONNECT BY LEVEL <= 65504)
+         WHERE cp NOT BETWEEN 55296 AND 57343
+           AND REGEXP_LIKE(UNISTR('\\' || LPAD(TRIM(TO_CHAR(cp, 'XXXX')), 4, '0')), :c, 'i')
+           AND INSTR(NLS_LOWER(UNISTR('\\' || LPAD(TRIM(TO_CHAR(cp, 'XXXX')), 4, '0')), 'NLS_SORT=BINARY'), :c) = 0"""
+    missed = {}
+    with reader_connection.cursor() as cur:
+        for ch in sorted(_SAFE_FOLD):
+            cur.execute(sql, c=ch)
+            rows = cur.fetchall()
+            if rows:
+                missed[ch] = [hex(r[0]) for r in rows]
+    assert missed == {}

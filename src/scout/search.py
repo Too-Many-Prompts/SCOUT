@@ -14,7 +14,7 @@ import oracledb
 
 from scout import db
 from scout.config import ConnectionConfig, default_threads
-from scout.pattern import build_regex, min_match_length
+from scout.pattern import build_regex, min_match_length, required_literal
 
 
 class DictionaryTier(str, Enum):
@@ -75,6 +75,7 @@ ProgressCallback = Callable[[int, int], None]  # (columns_done, columns_total)
 SkipCallback = Callable[[Column, Exception], None]  # a column that could not be searched
 
 
+PRECHECK = True  # cheap substring test before the regex; kept only if the benchmark justifies it
 SEARCHABLE_TYPES = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB")
 _DONE = object()
 
@@ -159,15 +160,26 @@ def _search_column(
     flags: str,
     stop: threading.Event,
     limit: int | None = None,
+    literal: str | None = None,
+    fold: bool = False,
 ) -> Generator[Match, None, ColumnOutcome]:
-    """Yield the column's matches (at most `limit`); returns its ColumnOutcome."""
+    """Yield the column's matches (at most `limit`); returns its ColumnOutcome.
+
+    `literal` (from pattern.required_literal) adds a cheap substring test ahead of the regex;
+    `fold` says the search is case-insensitive, so the column is lowercased first."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
     sql = (
         f"SELECT ROWID, {name} FROM {_quote(col.owner)}.{_quote(col.table)} "
-        f"WHERE REGEXP_LIKE({name}, :pat, :flags)"
+        f"WHERE "
     )
     binds: dict[str, object] = {"pat": pattern, "flags": flags}
+    if literal is not None:
+        # a necessary condition of the regex, so it can only skip rows that cannot match
+        haystack = f"NLS_LOWER({name}, 'NLS_SORT=BINARY')" if fold else name
+        sql += f"INSTR({haystack}, :lit) > 0 AND "
+        binds["lit"] = literal
+    sql += f"REGEXP_LIKE({name}, :pat, :flags)"
     if limit is not None:
         sql += " FETCH FIRST :lim ROWS ONLY"
         binds["lim"] = limit + 1  # one extra row tells us there are more
@@ -211,9 +223,10 @@ def drill_down(pool: oracledb.ConnectionPool, column: Column, opts: SearchOption
     """Every hit for one column (opts.limit_per_column is ignored), streamed from one
     borrowed read-only connection. Closing the generator stops the fetch."""
     pattern, flags = build_regex(opts)
+    literal = required_literal(opts) if PRECHECK else None
     stop = threading.Event()
     with db.acquire(pool) as conn:
-        gen = _search_column(conn, column, pattern, flags, stop, None)
+        gen = _search_column(conn, column, pattern, flags, stop, None, literal, not opts.case_sensitive)
         try:
             yield from gen
         finally:
@@ -255,6 +268,7 @@ def search(
     if opts.limit_per_column is not None and opts.limit_per_column < 1:
         raise ValueError("limit_per_column must be at least 1")
     pattern, flags = build_regex(opts)  # validates the options before touching the database
+    literal = required_literal(opts) if PRECHECK else None
     threads = max(1, opts.threads)
     own_pool = pool is None
     if own_pool:
@@ -276,7 +290,9 @@ def search(
                 return
             try:
                 with db.acquire(pool) as conn:
-                    gen = _search_column(conn, col, pattern, flags, stop, opts.limit_per_column)
+                    gen = _search_column(
+                        conn, col, pattern, flags, stop, opts.limit_per_column, literal, not opts.case_sensitive
+                    )
                     results.put(_drain(gen, results.put))
             except oracledb.DatabaseError as exc:
                 if on_skip is None:

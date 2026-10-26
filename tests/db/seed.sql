@@ -75,6 +75,18 @@ INSERT INTO scout_odd."MixedCase Table" VALUES (2, 'color');
 INSERT INTO scout_odd."MixedCase Table" VALUES (3, 'Colorado');
 INSERT INTO scout_odd."MixedCase Table" VALUES (4, 'The colors are bright');
 INSERT INTO scout_odd."MixedCase Table" VALUES (5, 'it''s a ''quoted'' value');
+-- Characters Oracle's case-insensitive matching treats as equal to plain letters (Kelvin sign
+-- = k, long s = s, sharp s = ss, ligatures = fi/ffi/...). Built with UNISTR so the file's
+-- encoding cannot change them. 'narrow' holds exactly one character.
+CREATE TABLE scout_odd."Unicode Edge" (id NUMBER, txt VARCHAR2(80 CHAR), narrow VARCHAR2(1 CHAR));
+INSERT INTO scout_odd."Unicode Edge" VALUES (1, 'Kelvin ' || UNISTR('\212A') || ' sign', UNISTR('\212A'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (2, 'long ' || UNISTR('\017F') || 'afe harbour', UNISTR('\017F'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (3, 'Stra' || UNISTR('\00DF') || 'e', UNISTR('\00DF'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (4, UNISTR('\FB01') || 'ne print', UNISTR('\FB01'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (5, 'o' || UNISTR('\FB03') || 'ce supplies', UNISTR('\FB03'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (6, UNISTR('\0130') || 'stanbul', UNISTR('\0130'));
+INSERT INTO scout_odd."Unicode Edge" VALUES (7, 'plain ascii: office, fine, strasse, kelvin, safe', 'x');
+
 -- the only hit is the last of 200 rows: locate mode must still report this column
 CREATE TABLE scout_odd.late_hit (id NUMBER, txt VARCHAR2(100));
 INSERT INTO scout_odd.late_hit
@@ -108,4 +120,5 @@ GRANT SELECT ON scout_docs.plain_notes       TO scout_reader;
 GRANT SELECT ON scout_odd."MixedCase Table"  TO scout_reader;
 GRANT SELECT ON scout_odd.nums               TO scout_reader;
 GRANT SELECT ON scout_odd.late_hit           TO scout_reader;
+GRANT SELECT ON scout_odd."Unicode Edge"   TO scout_reader;
 GRANT SELECT ON scout_broken.ext_missing     TO scout_reader;

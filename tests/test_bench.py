@@ -2,14 +2,16 @@
 import pytest
 
 from scout.search import SearchOptions, search
-from tests.bench.load import ABSENT, NEEDLE, SCHEMA, build
+from tests.bench.load import ABSENT, NEEDLE, build
+
+SCHEMA = "SCOUT_BENCH_TINY"  # never SCOUT_BENCH: that holds the large dataset
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def tiny_bench(admin_writer_connection):
-    build(admin_writer_connection, tables=2, rows=50)
+    build(admin_writer_connection, tables=2, rows=50, schema=SCHEMA)
 
 
 def run(cfg, term):
