@@ -198,17 +198,18 @@ def _search_column(
     `fold` says the search is case-insensitive, so the column is lowercased first."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
-    sql = (
-        f"SELECT ROWID, {name} FROM {_quote(col.owner)}.{_quote(col.table)} "
-        f"WHERE "
-    )
+    regex = f"REGEXP_LIKE({name}, :pat, :flags)"
     binds: dict[str, object] = {"pat": pattern, "flags": flags}
     if literal is not None:
-        # a necessary condition of the regex, so it can only skip rows that cannot match
+        # The substring test is a necessary condition of the regex, so it can only skip rows that
+        # cannot match. It is nested in CASE because Oracle does not promise to evaluate AND terms
+        # in order (measured: the regex ran on every row anyway), but does short-circuit CASE.
         haystack = f"NLS_LOWER({name}, 'NLS_SORT=BINARY')" if fold else name
-        sql += f"INSTR({haystack}, :lit) > 0 AND "
+        condition = f"CASE WHEN INSTR({haystack}, :lit) > 0 THEN CASE WHEN {regex} THEN 1 END END = 1"
         binds["lit"] = literal
-    sql += f"REGEXP_LIKE({name}, :pat, :flags)"
+    else:
+        condition = regex
+    sql = f"SELECT ROWID, {name} FROM {_quote(col.owner)}.{_quote(col.table)} WHERE {condition}"
     if limit is not None:
         sql += " FETCH FIRST :lim ROWS ONLY"
         binds["lim"] = limit + 1  # one extra row tells us there are more
