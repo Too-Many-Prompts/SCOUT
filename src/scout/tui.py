@@ -1,12 +1,15 @@
+import re
 from dataclasses import replace
 
+from rich.text import Text
 from textual import work
 from textual.worker import get_current_worker
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label
+from textual.theme import Theme
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, ProgressBar
 
 from scout import db
 from scout import search as search_core
@@ -23,6 +26,68 @@ from scout.export import write_csv
 from scout.search import Column, ColumnOutcome, ColumnTimeout, Match, SearchOptions
 
 
+# One accent. Amber means "a hit"; the rest of the palette stays cool and quiet.
+SCOUT_THEME = Theme(
+    name="scout",
+    primary="#F2B134",  # signal amber: the hit
+    secondary="#6FB79B",  # lichen: progress, done
+    accent="#F2B134",
+    warning="#C98A2B",  # dimmer amber: partial / cut off
+    error="#E5645B",
+    success="#6FB79B",
+    foreground="#D6DED9",
+    background="#0F1B22",  # survey ink
+    surface="#172830",  # plate
+    panel="#1E3340",
+    dark=True,
+)
+
+HIT_STYLE = "bold #F2B134"
+
+SCOUT_CSS = """
+Screen { background: $background; }
+Input { border: none; height: 1; padding: 0 1; background: $panel; }
+Input:focus { border: none; background: $surface; }
+Button { border: none; height: 1; min-width: 12; }
+Checkbox { border: none; height: 1; padding: 0 1; background: transparent; }
+#login { width: 64; height: auto; margin: 1 4; padding: 0 2; border: round $panel; border-title-color: $primary; }
+#login .field { height: 2; }
+#login .field Label { width: 12; padding: 0 1 0 0; color: $text-muted; }
+#login .field Input { width: 1fr; }
+#login-button { margin-top: 0; }
+#login-error { padding: 0; color: $error; }
+#login-error.busy { color: $text-muted; }
+
+#search-panel { height: auto; padding: 0 1; border: round $panel; border-title-color: $primary; }
+#search-form, #options, #export-form { height: auto; }
+#search-form Input { width: 1fr; }
+#near { width: 22; }
+#threads { width: 12; }
+#options Checkbox { width: auto; }
+#options, #export-form { margin-top: 1; }
+#options Button, #export-form Button { width: auto; margin-left: 1; }
+#export-form Input { width: 36; }
+#search { background: $primary; color: #0F1B22; text-style: bold; }
+
+#progress-row { height: auto; padding: 0 1; }
+#progress { width: 28; }
+#status { width: 1fr; padding: 0 1; color: $text; }
+#status.ok { color: $success; }
+#status.warn { color: $warning; }
+#status.error { color: $error; }
+
+#body { height: 1fr; }
+#found-pane { width: 50%; height: 100%; border: round $panel; border-title-color: $primary; }
+#hits-pane { width: 1fr; height: 100%; border: round $panel; border-title-color: $primary; }
+#found { height: 1fr; }
+#show-all { width: 100%; }
+#results { height: 1fr; }
+#empty { padding: 1 2; color: $text-muted; }
+#skipped { height: auto; max-height: 6; border: round $warning; border-title-color: $warning; }
+DataTable { background: $background; }
+"""
+
+
 class LoginScreen(Screen):
     """Asks for the connection once; the resulting db.Session is reused by every search.
 
@@ -35,15 +100,24 @@ class LoginScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="login"):
-            yield Label("Log in to Oracle")
-            yield Input(self.cfg.host, placeholder="host", id="login-host")
-            yield Input(str(self.cfg.port), placeholder="port", id="login-port")
-            yield Input(self.cfg.service_name, placeholder="service name", id="login-service")
-            yield Input(self.cfg.user or "", placeholder="user", id="login-user")
-            yield Input(placeholder="password", password=True, id="login-password")
-            yield Input(",".join(self.schemas), placeholder="schema(s) to search, blank = all visible", id="login-schema")
-            yield Button("Log in", id="login-button")
+        with Vertical(id="login") as box:
+            box.border_title = "Log in to Oracle"
+            for label, wid, inp in (
+                ("Host", "login-host", Input(self.cfg.host, placeholder="localhost", id="login-host")),
+                ("Port", "login-port", Input(str(self.cfg.port), placeholder="1521", id="login-port")),
+                ("Service", "login-service", Input(self.cfg.service_name, placeholder="service name", id="login-service")),
+                ("User", "login-user", Input(self.cfg.user or "", placeholder="user", id="login-user")),
+                ("Password", "login-password", Input(placeholder="password", password=True, id="login-password")),
+                (
+                    "Schema(s)",
+                    "login-schema",
+                    Input(",".join(self.schemas), placeholder="comma-separated; blank = every visible schema", id="login-schema"),
+                ),
+            ):
+                with Horizontal(classes="field"):
+                    yield Label(label)
+                    yield inp
+            yield Button("Log in", id="login-button", variant="primary")
             yield Label(self.error, id="login-error")
 
     def on_mount(self) -> None:
@@ -60,7 +134,9 @@ class LoginScreen(Screen):
         return self.query_one(f"#{wid}", Input).value.strip()
 
     def _fail(self, text: str) -> None:
-        self.query_one("#login-error", Label).update(text)
+        err = self.query_one("#login-error", Label)
+        err.remove_class("busy")
+        err.update(text)
         self.query_one("#login-button", Button).disabled = False
 
     def submit(self) -> None:
@@ -79,7 +155,9 @@ class LoginScreen(Screen):
                 return self._fail("Error: user and password are required")
             schemas = tuple(s.strip() for s in self._text("login-schema").split(",") if s.strip())
             self.query_one("#login-button", Button).disabled = True
-            self.query_one("#login-error", Label).update("Connecting...")
+            err = self.query_one("#login-error", Label)
+            err.add_class("busy")
+            err.update("Connecting...")
             self._connect(cfg, schemas)
 
     @work(thread=True, exclusive=True, group="login")
@@ -103,19 +181,9 @@ class ScoutApp(App):
     BINDINGS = [
         Binding("ctrl+l", "logout", "Log out"),
         Binding("escape", "cancel_search", "Cancel search"),
+        Binding("ctrl+e", "export", "Export CSV"),
     ]
-    CSS = """
-    #login { width: 60; height: auto; margin: 2 4; }
-    #login Input { width: 1fr; }
-    #login-error { padding: 1 0; }
-    Horizontal { height: auto; }
-    Input { width: 1fr; }
-    Checkbox, Button { width: auto; }
-    #status { width: 1fr; padding: 1 1; }
-    #found { height: auto; max-height: 10; }
-    #results { height: 1fr; }
-    #skipped { height: auto; max-height: 8; }
-    """
+    CSS = SCOUT_CSS
 
     def __init__(self) -> None:
         super().__init__()
@@ -128,37 +196,53 @@ class ScoutApp(App):
         self.limited = False  # results are examples (locate mode), not every hit
         self.cut_off: set[tuple[str, str, str]] = set()  # columns with more hits than shown / timed out
         self.partial = False  # the run was cancelled or timed out: whatever is listed is not everything
+        self._highlight: re.Pattern | None = None  # cosmetic: marks the searched text in the Value column
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal(id="search-form"):
-            yield Input(placeholder="search term(s); * and ? are wildcards", id="terms")
-            yield Input(placeholder="within N words (two terms)", id="near")
-            yield Input(str(default_threads()), placeholder="threads", id="threads")
-        with Horizontal(id="options"):
-            yield Checkbox("whole word", id="whole_word")
-            yield Checkbox("case sensitive", id="case")
-            yield Checkbox("every hit (slower)", id="all_hits")
-            yield Button("Search", id="search")
-            yield Button("Cancel", id="cancel")
-            yield Button("Show all hits", id="show-all")
-        with Horizontal(id="export-form"):
-            yield Input("scout_results.csv", placeholder="csv path", id="csv_path")
-            yield Button("Export CSV", id="export")
+        with Vertical(id="search-panel") as panel:
+            panel.border_title = "Search"
+            with Horizontal(id="search-form"):
+                yield Input(placeholder="search term(s); * and ? are wildcards", id="terms")
+                yield Input(placeholder="within N words (two terms)", id="near")
+                yield Input(str(default_threads()), placeholder="threads", id="threads")
+            with Horizontal(id="options"):
+                yield Checkbox("whole word", id="whole_word")
+                yield Checkbox("case sensitive", id="case")
+                yield Checkbox("every hit (slower)", id="all_hits")
+                yield Button("Search", id="search")
+                yield Button("Cancel", id="cancel", variant="error", disabled=True)
+            with Horizontal(id="export-form"):
+                yield Input("scout_results.csv", placeholder="csv path", id="csv_path")
+                yield Button("Export CSV", id="export")
+        with Horizontal(id="progress-row"):
+            yield ProgressBar(total=100, show_eta=False, show_percentage=True, id="progress")
             yield Label("", id="status")
-        yield DataTable(id="found")
-        yield DataTable(id="results")
+        with Horizontal(id="body"):
+            with Vertical(id="found-pane") as pane:
+                pane.border_title = "Where it was found"
+                yield DataTable(id="found")
+                yield Button("Show all hits", id="show-all")
+            with Vertical(id="hits-pane") as pane:
+                pane.border_title = "Hits"
+                yield Label("No search yet. Type a term and press Enter.", id="empty")
+                yield DataTable(id="results")
         yield DataTable(id="skipped")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.register_theme(SCOUT_THEME)
+        self.theme = "scout"
         found = self.query_one("#found", DataTable)
-        found.add_columns("Where it was found", "Examples", "More")
+        found.add_columns("Column", "Examples", "More")
         found.cursor_type = "row"
-        found.display = False
-        self.query_one("#results", DataTable).add_columns("Owner", "Table", "Column", "Value")
+        results = self.query_one("#results", DataTable)
+        results.add_columns("Owner", "Table", "Column", "Value")
+        results.display = False
+        self.query_one("#progress", ProgressBar).display = False
         skipped = self.query_one("#skipped", DataTable)
         skipped.add_columns("Skipped column", "Reason")
+        skipped.border_title = "Skipped columns"
         skipped.display = False
         self.push_screen(LoginScreen(load_defaults(), default_schemas()))
 
@@ -199,13 +283,43 @@ class ScoutApp(App):
     def _value(self, wid: str) -> str:
         return str(self.query_one(f"#{wid}").value).strip()
 
-    def _status(self, text: str) -> None:
-        self.query_one("#status", Label).update(text)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in ("terms", "near", "threads"):
+            self.run_search()
+        elif event.input.id == "csv_path":
+            self.export_csv()
+
+    def action_export(self) -> None:
+        if self.session is not None and not isinstance(self.screen, LoginScreen):
+            self.export_csv()
+
+    def _status(self, text: str, kind: str = "") -> None:
+        """Set the status line; kind (ok / warn / error) colours it."""
+        label = self.query_one("#status", Label)
+        label.set_classes(kind)
+        label.update(text)
+
+    def _set_running(self, running: bool) -> None:
+        """Cancel only makes sense while a search or drill-down runs; the bar only then too."""
+        self.query_one("#cancel", Button).disabled = not running
+        bar = self.query_one("#progress", ProgressBar)
+        bar.display = running
+        if not running:
+            bar.update(progress=0)
+
+    def _show_hits(self, empty_text: str | None = None) -> None:
+        """Swap between the hits table and a short hint when there is nothing to list."""
+        empty = self.query_one("#empty", Label)
+        results = self.query_one("#results", DataTable)
+        empty.display = empty_text is not None
+        results.display = empty_text is None
+        if empty_text is not None:
+            empty.update(empty_text)
 
     def run_search(self) -> None:
         session = self.session
         if session is None:
-            self._status("Error: not logged in")
+            self._status("Error: not logged in", "error")
             return
         try:
             every_hit = self.query_one("#all_hits", Checkbox).value
@@ -225,8 +339,9 @@ class ScoutApp(App):
 
             build_regex(opts)
         except ValueError as exc:
-            self._status(f"Error: {exc}")
+            self._status(f"Error: {exc}", "error")
             return
+        self._highlight = _highlight_pattern(opts)
         self.action_cancel_search()  # a new search replaces a running one, on the server too
         self.matches = []
         self.skipped = 0
@@ -239,10 +354,11 @@ class ScoutApp(App):
         self.query_one("#results", DataTable).clear()
         found = self.query_one("#found", DataTable)
         found.clear()
-        found.display = False
         skipped = self.query_one("#skipped", DataTable)
         skipped.clear()
         skipped.display = False
+        self._show_hits("Searching...")
+        self._set_running(True)
         self._status("Searching...")
         self._search_worker(session, opts, self.token)
 
@@ -256,7 +372,7 @@ class ScoutApp(App):
 
         def progress(p: Progress) -> None:
             if live() and not token.cancelled:
-                self.call_from_thread(self._status, _progress_text(p))
+                self.call_from_thread(self._progress, p)
 
         def on_skip(col, exc) -> None:
             if live():
@@ -275,21 +391,34 @@ class ScoutApp(App):
                 self.call_from_thread(self._add_match, m)
         except Exception as exc:  # surface DB/connection errors in the UI instead of crashing
             if live():
-                self.call_from_thread(self._status, f"Error: {exc}")
+                self.call_from_thread(self._failed, f"Error: {exc}")
             return
         if live():
             self.call_from_thread(self._finished, token.cancelled)
 
+    def _progress(self, p: Progress) -> None:
+        self.query_one("#progress", ProgressBar).update(progress=round(p.fraction * 100))
+        self._status(_progress_text(p))
+
+    def _failed(self, text: str) -> None:
+        self._set_running(False)
+        if not self.matches:
+            self._show_hits("The search stopped before any match was found.")
+        self._status(text, "error")
+
     def _finished(self, cancelled: bool) -> None:
         n = len(self.matches)
+        self._set_running(False)
+        if not n:
+            self._show_hits("No matches." + _no_match_hint(self.opts))
         if cancelled:
             self.partial = True
-            self._status(f"Cancelled: {n} match(es) so far (partial)")
+            self._status(f"Cancelled: {n} match(es) so far (partial)", "warn")
             return
         more = sum(1 for o in self.outcomes.values() if o.more_available)
         note = f"; {more} column(s) have more, select one and press Show all hits" if more else ""
         skip = f"; skipped {self.skipped} column(s), see below" if self.skipped else ""
-        self._status(f"Done: {n} match(es){note}{skip}")
+        self._status(f"Done: {n} match(es){note}{skip}", "warn" if more or self.skipped else "ok")
 
     def action_cancel_search(self) -> None:
         """Stop the running search or drill-down, interrupting the database as well."""
@@ -309,23 +438,27 @@ class ScoutApp(App):
             return
         note = "partial: timed out" if outcome.timed_out else "more available" if outcome.more_available else ""
         found = self.query_one("#found", DataTable)
-        found.display = True
-        found.add_row(ref, str(outcome.examples), note, key=ref)
+        found.add_row(
+            ref,
+            Text(str(outcome.examples), justify="right"),
+            Text(note, style="#C98A2B" if outcome.timed_out else "#F2B134"),
+            key=ref,
+        )
 
     def show_all_hits(self) -> None:
         """Replace the results with every hit for the column selected in the found table."""
         found = self.query_one("#found", DataTable)
         if self.session is None or self.opts is None or not found.row_count:
-            self._status("Select a column in the list of where it was found first.")
+            self._status("Select a column in the list of where it was found first.", "warn")
             return
         try:
             ref = found.coordinate_to_cell_key(found.cursor_coordinate).row_key.value
         except Exception:
-            self._status("Select a column in the list of where it was found first.")
+            self._status("Select a column in the list of where it was found first.", "warn")
             return
         outcome = self.outcomes.get(ref)
         if outcome is None:
-            self._status("Select a column in the list of where it was found first.")
+            self._status("Select a column in the list of where it was found first.", "warn")
             return
         self.action_cancel_search()
         self.token = CancelToken()
@@ -334,6 +467,8 @@ class ScoutApp(App):
         self.cut_off = set()
         self.partial = False
         self.query_one("#results", DataTable).clear()
+        self._show_hits()
+        self._set_running(True)
         self._status(f"Fetching every hit in {ref}...")
         every = replace(self.opts, limit_per_column=None, time_limit=None)
         self._drill_worker(self.session, outcome.column, every, self.token, ref)
@@ -353,17 +488,22 @@ class ScoutApp(App):
             return
         except Exception as exc:
             if not worker.is_cancelled:
-                self.call_from_thread(self._status, f"Error: {exc}")
+                self.call_from_thread(self._failed, f"Error: {exc}")
             return
         if not worker.is_cancelled:
             if token.cancelled:
                 self.call_from_thread(self._drill_partial, f"Cancelled: {len(self.matches)} hit(s) in {ref} so far (partial)")
             else:
-                self.call_from_thread(self._status, f"All {len(self.matches)} hit(s) in {ref}")
+                self.call_from_thread(self._drill_done, f"All {len(self.matches)} hit(s) in {ref}")
+
+    def _drill_done(self, text: str) -> None:
+        self._set_running(False)
+        self._status(text, "ok")
 
     def _drill_partial(self, text: str) -> None:
         self.partial = True
-        self._status(text)
+        self._set_running(False)
+        self._status(text, "warn")
 
     def _add_skipped(self, col, exc) -> None:
         self.skipped += 1
@@ -374,8 +514,13 @@ class ScoutApp(App):
 
     def _add_match(self, m: Match) -> None:
         self.matches.append(m)
+        if len(self.matches) == 1:
+            self._show_hits()
+        value = Text(" ".join(m.value.split()), no_wrap=True, overflow="ellipsis")
+        if self._highlight is not None:
+            value.highlight_regex(self._highlight, HIT_STYLE)
         self.query_one("#results", DataTable).add_row(
-            m.owner, m.table, m.column, " ".join(m.value.split())
+            Text(m.owner, style="dim"), Text(m.table, style="dim"), Text(m.column, style="bold"), value
         )
 
     def export_csv(self) -> None:
@@ -389,7 +534,7 @@ class ScoutApp(App):
             with open(path, "w", newline="") as fp:
                 n = write_csv(self.matches, fp, incomplete if labelled else None)
         except OSError as exc:
-            self._status(f"Export failed: {exc}")
+            self._status(f"Export failed: {exc}", "error")
             return
         if self.partial:
             note = " (partial: the search was cancelled or timed out)"
@@ -397,7 +542,40 @@ class ScoutApp(App):
             note = " (examples only for columns marked complete=no; use Show all hits for the rest)"
         else:
             note = ""
-        self._status(f"Wrote {n} row(s) to {path}{note}")
+        self._status(f"Wrote {n} row(s) to {path}{note}", "warn" if note else "ok")
+
+
+def _no_match_hint(opts: SearchOptions | None) -> str:
+    if opts is None:
+        return ""
+    if opts.whole_word:
+        return " Try turning off whole word."
+    if opts.case_sensitive:
+        return " Try turning off case sensitive."
+    return " Try fewer words, or a * wildcard."
+
+
+def _highlight_pattern(opts: SearchOptions) -> re.Pattern | None:
+    """Cosmetic: a regex that marks the searched text in a hit. Oracle decides what matched;
+    this only paints it, so any term it cannot express simply goes unmarked."""
+    parts = []
+    for term in opts.terms:
+        out, i = [], 0
+        while i < len(term):
+            c = term[i]
+            if c == "\\" and i + 1 < len(term):
+                out.append(re.escape(term[i + 1]))
+                i += 2
+                continue
+            out.append(r"\w*" if c == "*" else r"\w" if c == "?" else re.escape(c))
+            i += 1
+        parts.append("".join(out))
+    if not parts:
+        return None
+    try:
+        return re.compile("|".join(parts), 0 if opts.case_sensitive else re.IGNORECASE)
+    except re.error:
+        return None
 
 
 def _progress_text(p: Progress) -> str:

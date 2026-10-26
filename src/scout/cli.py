@@ -36,6 +36,21 @@ from scout.search import search as run_search
 app = typer.Typer(help="SCOUT: search Oracle databases of unknown schema for strings.")
 
 
+def _error(message: str) -> None:
+    typer.secho(message, fg=typer.colors.RED, err=True)
+
+
+def _bar(fraction: float, width: int = 12) -> str:
+    filled = round(max(0.0, min(1.0, fraction)) * width)
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _split_ref(ref: str) -> tuple[str, str]:
+    """('OWNER.TABLE.', 'COLUMN'): the schema path is dimmed, the column name is what you look for."""
+    head, _, tail = ref.rpartition(".")
+    return (head + "." if head else ""), tail
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     """SCOUT: search Oracle databases of unknown schema for strings.
@@ -61,9 +76,15 @@ def shell(
     try:
         session = db.open_session(cfg, schemas, threads if threads is not None else default_threads())
     except oracledb.Error as exc:
-        typer.secho(f"Database error: {exc}", fg=typer.colors.RED, err=True)
+        _error(f"Database error: {exc}")
         raise typer.Exit(1) from exc
-    typer.echo("Connected. Type 'help' for commands, 'exit' to quit.", err=True)
+    scope = ", ".join(schemas) if schemas else "every visible schema"
+    typer.echo(
+        typer.style("Connected", fg=typer.colors.GREEN, bold=True)
+        + f" as {cfg.user}@{cfg.host}:{cfg.port}/{cfg.service_name}; searching {scope}.",
+        err=True,
+    )
+    typer.echo("Type 'help' for commands, 'exit' to quit.", err=True)
     try:
         _shell_loop(session)
     finally:
@@ -74,14 +95,14 @@ def _shell_loop(session: db.Session) -> None:
     search_cmd = typer.main.get_command(app).commands["search"]  # type: ignore[attr-defined]
     while True:
         try:
-            line = typer.prompt("scout", default="", show_default=False, prompt_suffix="> ")
+            line = typer.prompt(typer.style("scout", fg=typer.colors.YELLOW, bold=True), default="", show_default=False, prompt_suffix="> ")
         except typer.Abort:  # Ctrl-D / Ctrl-C
             typer.echo()
             return
         try:
             args = shlex.split(line)
         except ValueError as exc:
-            typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+            _error(f"Error: {exc}")
             continue
         if not args:
             continue
@@ -89,11 +110,14 @@ def _shell_loop(session: db.Session) -> None:
         if name in ("exit", "quit"):
             return
         if name == "help":
-            typer.echo("  search [OPTIONS] TERMS...   search the schema(s) chosen at login (try: search --help)")
-            typer.echo("      quote words with * or ? ; for a literal star use single quotes: search 'a\\*'")
-            typer.echo("  more OWNER.TABLE.COLUMN      every hit in one column of the last search")
-            typer.echo("  help                        this list")
-            typer.echo("  exit | quit                 leave")
+            for cmd, text in (
+                ("search [OPTIONS] TERMS...", "search the schema(s) chosen at login (try: search --help)"),
+                ("", "quote words with * or ? ; for a literal star use single quotes: search 'a\\*'"),
+                ("more OWNER.TABLE.COLUMN", "every hit in one column of the last search"),
+                ("help", "this list"),
+                ("exit | quit", "leave"),
+            ):
+                typer.echo("  " + typer.style(f"{cmd:<27}", bold=True) + text)
         elif name == "more":
             if session.last_opts is None:
                 typer.echo("Run a search first; 'more' shows every hit for a column it found.", err=True)
@@ -103,7 +127,7 @@ def _shell_loop(session: db.Session) -> None:
                 every = replace(session.last_opts, limit_per_column=None, time_limit=None)
                 try:
                     if not _drill(session, every, rest[0], None):
-                        typer.secho(f"No searchable column {rest[0]!r}.", fg=typer.colors.RED, err=True)
+                        _error(f"No searchable column {rest[0]!r}.")
                 except typer.Exit:
                     pass
         elif name == "search":
@@ -116,7 +140,7 @@ def _shell_loop(session: db.Session) -> None:
             except SystemExit:  # typer exits after printing some errors itself
                 pass
         else:
-            typer.secho(f"Unknown command {args[0]!r}; type 'help'.", fg=typer.colors.RED, err=True)
+            _error(f"Unknown command {args[0]!r}; type 'help'.")
 
 
 @app.command()
@@ -194,7 +218,7 @@ def search(
             try:
                 session = owned = db.open_session(cfg, schemas, opts.threads)
             except oracledb.Error as exc:
-                typer.secho(f"Database error: {exc}", fg=typer.colors.RED, err=True)
+                _error(f"Database error: {exc}")
                 raise typer.Exit(1) from exc
         try:
             if not _drill(session, opts, column_ref, csv_path):
@@ -220,8 +244,8 @@ def search(
         columns_searched = p.columns_total
         if show_progress:
             slow = f" · slowest {p.in_flight[0][0]} {p.in_flight[0][1]:.0f}s" if p.in_flight else ""
-            typer.echo(f"\r{p.columns_done}/{p.columns_total} columns · {p.fraction:.0%} · {p.hits} hits{slow}\x1b[K",
-                       nl=False, err=True)
+            line = f"{_bar(p.fraction)} {p.fraction:4.0%}  {p.columns_done}/{p.columns_total} columns · {p.hits} hits{slow}"
+            typer.echo("\r" + typer.style(line, dim=True) + "\x1b[K", nl=False, err=True)
 
     def on_skip(col: Column, exc: Exception) -> None:
         (timed_out if isinstance(exc, ColumnTimeout) else skipped).append(col if isinstance(exc, ColumnTimeout) else (col, exc))
@@ -232,7 +256,7 @@ def search(
             found.append(m)
             if show_progress:  # wipe the unfinished progress line so the hit starts on its own line
                 typer.echo("\r\x1b[K", nl=False, err=True)
-            typer.echo(f"{m.owner}.{m.table}.{m.column}\t{' '.join(m.value.split())}")
+            typer.echo(_hit_line(m))
     except KeyboardInterrupt:
         token.cancel()
         gen.close()
@@ -241,7 +265,7 @@ def search(
         typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(130) from None
     except oracledb.Error as exc:
-        typer.secho(f"Database error: {exc}", fg=typer.colors.RED, err=True)
+        _error(f"Database error: {exc}")
         raise typer.Exit(1) from exc
     finally:
         if show_progress:
@@ -256,10 +280,15 @@ def search(
     if csv_path:
         with csv_path.open("w", newline="") as fp:
             write_csv(found, fp, incomplete if labelled else None)
-    typer.echo(
-        f"{len(found)} match(es) in {columns_searched} column(s)" + (f"; wrote {csv_path}" if csv_path else ""),
-        err=True,
-    )
+    summary = f"{len(found)} match(es) in {columns_searched} column(s)" + (f"; wrote {csv_path}" if csv_path else "")
+    typer.secho(summary, fg=typer.colors.GREEN if found else None, bold=bool(found), err=True)
+    if not found:
+        if whole_word:
+            typer.echo("Try again without --whole-word: it also finds the term inside longer words.", err=True)
+        elif case_sensitive:
+            typer.echo("Try again with --ignore-case.", err=True)
+        else:
+            typer.echo("Try fewer words, or a * wildcard.", err=True)
     _print_where_found(outcomes, terms, in_shell=session is not None, limited=opts.limit_per_column is not None)
     if csv_path and labelled and incomplete:
         typer.echo(
@@ -278,6 +307,13 @@ def search(
             typer.echo(f"  {_ref(col)}: {str(exc).splitlines()[0]}", err=True)
 
 
+def _hit_line(m: Match) -> str:
+    """OWNER.TABLE.COLUMN<TAB>value. The colours vanish when stdout is not a terminal (click strips them),
+    so a pipe or a file still gets exactly the plain tab-separated line."""
+    head, tail = _split_ref(f"{m.owner}.{m.table}.{m.column}")
+    return typer.style(head, dim=True) + typer.style(tail, bold=True) + "\t" + " ".join(m.value.split())
+
+
 def _key(col: Column) -> tuple[str, str, str]:
     return (col.owner, col.table, col.column)
 
@@ -292,14 +328,18 @@ def _print_where_found(outcomes, terms, in_shell: bool, limited: bool) -> None:
     if not rows:
         return
     typer.secho("Where it was found:", bold=True, err=True)
+    width = max(len(_ref(o.column)) for o in rows)
     for o in rows:
         note = " (partial: timed out)" if o.timed_out else " (more available)" if o.more_available else ""
         what = f"{o.examples} example(s)" if limited else f"{o.examples} hit(s)"
-        typer.echo(f"  {_ref(o.column)}  {what}{note}", err=True)
+        head, tail = _split_ref(_ref(o.column))
+        pad = " " * (width - len(_ref(o.column)))
+        flag = typer.style(note, fg=typer.colors.YELLOW) if note else ""
+        typer.echo(f"  {typer.style(head, dim=True)}{typer.style(tail, bold=True)}{pad}  {what:>15}{flag}", err=True)
         if o.more_available:
             ref = shlex.quote(_ref(o.column))
             hint = f"more {ref}" if in_shell else f"scout search {shlex.join(terms)} --column {_quote_ref(_ref(o.column))}"
-            typer.echo(f"      every hit: {hint}", err=True)
+            typer.echo(typer.style(f"      every hit: {hint}", dim=True), err=True)
 
 
 def _quote_ref(ref: str) -> str:
@@ -317,7 +357,7 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
     try:
         for m in gen:
             found.append(m)
-            typer.echo(f"{m.owner}.{m.table}.{m.column}\t{' '.join(m.value.split())}")
+            typer.echo(_hit_line(m))
     except ColumnTimeout as exc:
         timed_out = exc  # what was found is kept, but the list is not every hit
     except KeyboardInterrupt:
@@ -326,7 +366,7 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
         typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(130) from None
     except oracledb.Error as exc:
-        typer.secho(f"Database error: {exc}", fg=typer.colors.RED, err=True)
+        _error(f"Database error: {exc}")
         raise typer.Exit(1) from exc
     if token.cancelled:  # the interrupt reached the database but Python never saw the signal
         typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)

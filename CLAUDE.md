@@ -9,12 +9,12 @@ with unknown schema for strings. Ships both a CLI and a Textual TUI against the 
 search logic.
 
 Implemented: column discovery, pattern building, threaded search, CSV export, the CLI `search`
-command and the TUI search/export, locate mode with drill-down, cancel, time limits and live progress
+command and the TUI search/export (styled, themed front ends), locate mode with drill-down, cancel, time limits and live progress
 (design: `docs/superpowers/specs/2026-10-25-locate-first-search-design.md`, plan beside it, benchmark
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 313 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
+Status: 316 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -199,6 +199,17 @@ These shape how the modules below are built — read this before changing code.
 - **Schema scope is chosen at login.** Host, port, service name, user, password and the schema(s) to
   search (comma-separated, blank = every visible schema) are all asked before connecting; every
   table in the named schema is searched. In the shell `search --schema` overrides it per search.
+- **Front-end conventions.**
+  - *CLI:* stdout is exactly `OWNER.TABLE.COLUMN<TAB>value`; tests and scripts read it. All styling goes through
+    `typer.style`/`secho` (click strips it when not a tty) or to stderr, so never decorate a stdout line. Error
+    text is pinned by tests (`Database error`, `Unknown command`, `No searchable column`, `Error:`); `_error()`
+    prints the message as given.
+  - *TUI:* custom `scout` theme (`SCOUT_THEME`, `SCOUT_CSS` in `tui.py`); amber is reserved for "a hit". Tests
+    use the ids `#status #found #results #skipped #terms #search #cancel #show-all #export`; keep them. Do not
+    name an App method `_running` (Textual has an attribute of that name; ours is `_set_running`). Enter in
+    terms/near/threads runs the search, Ctrl+E exports, Cancel is enabled only while something runs, and hits are
+    marked by `_highlight_pattern` (cosmetic: Oracle decides what matched). "Show all hits" stays enabled on
+    purpose (a test expects the "Select a column" message).
 - **A broken column never sinks the crawl.** `search(..., on_skip=cb)` reports columns that fail
   (e.g. an external table whose file is missing) via `cb`, from the caller's thread, and carries
   on; the CLI and TUI list them at the end. Without `on_skip`, the error is raised. The seed's
@@ -209,7 +220,7 @@ These shape how the modules below are built — read this before changing code.
 ```
 src/scout/
   cli.py     # Typer app, entry point: `scout search ...`
-  tui.py     # Textual App
+  tui.py     # Textual App: theme + CSS, login and search screens
   search.py  # core search/crawl logic (SearchOptions, Match, search), UI-agnostic
   pattern.py # search options -> Oracle REGEXP_LIKE pattern (pure, no DB)
   config.py  # ConnectionConfig, defaults.txt/env defaults, default thread count

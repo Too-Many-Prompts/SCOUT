@@ -543,3 +543,49 @@ def test_progress_text_before_any_table_is_known():
     from scout.tui import _progress_text
 
     assert "Looking for tables" in _progress_text(Progress(0, 0, 0.0, (), 0, 0, 0))
+
+
+async def test_enter_in_the_term_box_runs_the_search_and_cancel_is_only_live_while_running(monkeypatch):
+    from scout.search import Match
+    from textual.widgets import Button
+
+    fake_login(monkeypatch)
+    calls = []
+    locate_fake(monkeypatch, calls, hits=[Match("O", "T", "C", "Albert Talbert")])
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        assert app.query_one("#cancel", Button).disabled  # nothing to cancel yet
+        assert "No search yet" in str(app.query_one("#empty").render())
+        app.query_one("#terms").focus()
+        app.query_one("#terms").value = "albert"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert len(calls) == 1 and calls[0]["opts"].terms == ("albert",)
+        assert app.query_one("#cancel", Button).disabled  # finished again
+        cell = app.query_one("#results", DataTable).get_row_at(0)[3]
+        assert {span.start for span in cell.spans} == {0, 8}  # both Albert and Talbert's albert are marked
+
+
+async def test_no_match_says_what_to_try_instead(monkeypatch):
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "zzz"
+        app.query_one("#whole_word").value = True
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "turning off whole word" in str(app.query_one("#empty").render())
+
+
+def test_highlight_pattern_follows_wildcards_and_escapes():
+    from scout.search import SearchOptions
+    from scout.tui import _highlight_pattern
+
+    pat = _highlight_pattern(SearchOptions(terms=("al*t?", r"a\*"), schemas=()))
+    assert pat.search("ALBERTS").group() == "ALBERTS"
+    assert pat.search("a*b").group() == "a*" and not pat.search("ab")
