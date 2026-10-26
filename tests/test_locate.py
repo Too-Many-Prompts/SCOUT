@@ -236,3 +236,72 @@ def test_nls_lower_never_misses_a_regex_match_for_the_safe_characters(reader_con
             if rows:
                 missed[ch] = [hex(r[0]) for r in rows]
     assert missed == {}
+
+
+# ---- single scan per table: same answers as column-by-column, reading each table once
+
+@pytest.fixture
+def single_scan(monkeypatch):
+    from scout import search as search_mod
+
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", True)
+
+
+def outcome_summary(outcomes):
+    return {col_key(o.column): (o.examples, o.more_available, o.timed_out) for o in outcomes}
+
+
+@pytest.mark.parametrize("term", TERMS + ["the", "fi"])
+@pytest.mark.parametrize("limit", [None, 1, 2])
+def test_single_scan_gives_the_same_columns_matches_and_outcomes(reader_config, monkeypatch, term, limit):
+    from scout import search as search_mod
+
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", False)
+    per_col, out_a = run(reader_config, term, limit_per_column=limit)
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", True)
+    per_tab, out_b = run(reader_config, term, limit_per_column=limit)
+    assert outcome_summary(out_a) == outcome_summary(out_b)
+    if limit is None:
+        assert {m.key for m in per_col} == {m.key for m in per_tab}
+    else:  # which examples come back may differ; they must still be real hits
+        complete, _ = run(reader_config, term)
+        assert {m.key for m in per_tab} <= {m.key for m in complete}
+
+
+def test_single_scan_reports_a_broken_table_once_per_column(reader_config, single_scan):
+    skipped = []
+    opts = SearchOptions(terms=("x",), schemas=("SCOUT_BROKEN",), threads=2)
+    list(search(reader_config, opts, on_skip=lambda c, e: skipped.append(col_key(c))))
+    assert skipped == [ex.BROKEN]
+
+
+def test_single_scan_stops_early_once_every_column_has_enough_hits():
+    import threading
+    from unittest.mock import MagicMock
+
+    from scout.search import Column, _search_table
+
+    fetched = []
+
+    class Cur:
+        arraysize = 1
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, **binds): self.sql = sql
+        def fetchmany(self):
+            fetched.append(1)
+            return [("R", "hit a", "hit b")]
+
+    conn = MagicMock()
+    conn.cursor.return_value = Cur()
+    cols = [Column("O", "T", "A", "VARCHAR2"), Column("O", "T", "B", "VARCHAR2")]
+    gen = _search_table(conn, cols, "pat", "i", threading.Event(), 1, None, True)
+    got = []
+    try:
+        while True:
+            got.append(next(gen))
+    except StopIteration as done:
+        outcomes = done.value
+    assert len(fetched) == 2  # row 1 fills each column, row 2 proves 'more'; the rest is never read
+    assert [(o.examples, o.more_available) for o in outcomes] == [(1, True), (1, True)]
+    assert len(got) == 2

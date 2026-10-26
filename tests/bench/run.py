@@ -46,7 +46,13 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="also run each variant in locate mode")
     ap.add_argument("--precheck", choices=("on", "off"), default=None,
                     help="force the substring pre-check on or off (default: the library setting)")
+    ap.add_argument("--single-scan", choices=("on", "off"), default=None,
+                    help="force one scan per table on or off (default: the library setting)")
     args = ap.parse_args()
+    if args.single_scan:
+        import scout.search
+
+        scout.search.SINGLE_SCAN_PER_TABLE = args.single_scan == "on"
     if args.precheck:
         import scout.search
 

@@ -255,3 +255,32 @@ def test_other_database_errors_are_still_skips_or_raised(monkeypatch):
     FakeDb(TWO_TABLES[:1], {"C1": broken}).patch(monkeypatch)
     with pytest.raises(oracledb.DatabaseError, match="ORA-00942"):
         list(search(CFG, opts(time_limit=1)))
+
+
+# ---- needs the generated dataset: python -m tests.bench.load --tables 20 --rows 50000
+
+@pytest.mark.bench
+def test_cancel_stops_server_side_work(reader_config, admin_connection):
+    """End to end: cancel() ends a running search quickly and leaves no statement running.
+
+    With the pre-check on, each benchmark query is short, so this proves the quick stop and the
+    clean server state; that cancel() really interrupts a *long* statement is shown by the unit
+    tests (conn.cancel() is called, ORA-01013 is swallowed) and was measured directly: a
+    3e8-row CONNECT BY statement ended 0.32 s after Connection.cancel()."""
+    opts = SearchOptions(terms=("zzznotthere",), schemas=("SCOUT_BENCH",), threads=4)
+    token = CancelToken()
+    done = threading.Event()
+    threading.Thread(target=lambda: (list(search(reader_config, opts, cancel=token)), done.set()), daemon=True).start()
+    time.sleep(1.0)
+    assert not done.is_set(), "search finished before it could be cancelled; use a bigger dataset"
+    start = time.monotonic()
+    token.cancel()
+    assert done.wait(5), "search did not stop after cancel()"
+    assert time.monotonic() - start < 3
+    with admin_connection.cursor() as cur:
+        for _ in range(30):  # sessions may take a moment to wind down
+            cur.execute("SELECT COUNT(*) FROM v$session WHERE username = 'SCOUT_READER' AND status = 'ACTIVE'")
+            if cur.fetchone()[0] == 0:
+                return
+            time.sleep(0.1)
+    pytest.fail("a SCOUT_READER session is still running a statement after cancel()")

@@ -81,6 +81,7 @@ ProgressCallback = Callable[[Progress], None]
 SkipCallback = Callable[[Column, Exception], None]  # a column that could not be searched
 
 
+SINGLE_SCAN_PER_TABLE = False  # read each table once for all its string columns (see _search_table)
 HEARTBEAT_SECONDS = 1.0  # progress is re-sent at least this often while a search is running
 TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})  # thick driver: call_timeout exceeded
 PRECHECK = True  # cheap substring test before the regex; kept only if the benchmark justifies it
@@ -182,6 +183,18 @@ def prune_columns(columns: list[Column], opts: SearchOptions) -> list[Column]:
     return [c for c in columns if c.max_chars is None or c.max_chars >= need]
 
 
+def _condition(name: str, literal: str | None, fold: bool) -> str:
+    """WHERE-condition for one quoted column name; binds :pat, :flags (and :lit when pre-checking)."""
+    regex = f"REGEXP_LIKE({name}, :pat, :flags)"
+    if literal is None:
+        return regex
+    # The substring test is a necessary condition of the regex, so it can only skip rows that
+    # cannot match. It is nested in CASE because Oracle does not promise to evaluate AND terms
+    # in order (measured: the regex ran on every row anyway), but does short-circuit CASE.
+    haystack = f"NLS_LOWER({name}, 'NLS_SORT=BINARY')" if fold else name
+    return f"CASE WHEN INSTR({haystack}, :lit) > 0 THEN CASE WHEN {regex} THEN 1 END END = 1"
+
+
 def _search_column(
     conn: oracledb.Connection,
     col: Column,
@@ -198,17 +211,10 @@ def _search_column(
     `fold` says the search is case-insensitive, so the column is lowercased first."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
-    regex = f"REGEXP_LIKE({name}, :pat, :flags)"
     binds: dict[str, object] = {"pat": pattern, "flags": flags}
     if literal is not None:
-        # The substring test is a necessary condition of the regex, so it can only skip rows that
-        # cannot match. It is nested in CASE because Oracle does not promise to evaluate AND terms
-        # in order (measured: the regex ran on every row anyway), but does short-circuit CASE.
-        haystack = f"NLS_LOWER({name}, 'NLS_SORT=BINARY')" if fold else name
-        condition = f"CASE WHEN INSTR({haystack}, :lit) > 0 THEN CASE WHEN {regex} THEN 1 END END = 1"
         binds["lit"] = literal
-    else:
-        condition = regex
+    condition = _condition(name, literal, fold)
     sql = f"SELECT ROWID, {name} FROM {_quote(col.owner)}.{_quote(col.table)} WHERE {condition}"
     if limit is not None:
         sql += " FETCH FIRST :lim ROWS ONLY"
@@ -233,6 +239,56 @@ def _search_column(
             return ColumnOutcome(col, examples, more, timed_out=True)
         raise
     return ColumnOutcome(col, examples, more)
+
+
+def _search_table(
+    conn: oracledb.Connection,
+    cols: list[Column],
+    pattern: str,
+    flags: str,
+    stop: threading.Event,
+    limit: int | None = None,
+    literal: str | None = None,
+    fold: bool = False,
+) -> Generator[Match, None, list[ColumnOutcome]]:
+    """Search every column of one table in a single scan; returns one ColumnOutcome per column.
+
+    Each row is returned once with, per column, the value if that column matched (else NULL).
+    With a limit the scan stops as soon as every column has more hits than the limit; a column
+    with no hits keeps the scan going to the end of the table."""
+    owner, table = _quote(cols[0].owner), _quote(cols[0].table)
+    names = [_quote(c.column) for c in cols]
+    binds: dict[str, object] = {"pat": pattern, "flags": flags}
+    if literal is not None:
+        binds["lit"] = literal
+    conds = [_condition(n, literal, fold) for n in names]
+    select = ", ".join(f"CASE WHEN {c} THEN {n} END" for c, n in zip(conds, names))
+    sql = f"SELECT ROWID, {select} FROM {owner}.{table} WHERE {' OR '.join(conds)}"
+    counts, more, timed_out = [0] * len(cols), [False] * len(cols), False
+    try:
+        with conn.cursor() as cur:
+            cur.arraysize = 500
+            cur.execute(sql, **binds)
+            while not stop.is_set():
+                rows = cur.fetchmany()
+                if not rows:
+                    break
+                for rowid, *values in rows:
+                    for i, value in enumerate(values):
+                        if value is None:
+                            continue
+                        if limit is not None and counts[i] >= limit:
+                            more[i] = True
+                        else:
+                            counts[i] += 1
+                            yield Match(cols[i].owner, cols[i].table, cols[i].column, value, str(rowid))
+                if limit is not None and all(more):
+                    break
+    except oracledb.DatabaseError as exc:
+        if _error_code(exc) not in TIMEOUT_CODES:
+            raise
+        timed_out = True
+    return [ColumnOutcome(c, counts[i], more[i], timed_out) for i, c in enumerate(cols)]
 
 
 def resolve_column(conn: oracledb.Connection, ref: str, opts: SearchOptions) -> Column | None:
@@ -294,7 +350,7 @@ def drill_down(
             cancel.unlink(token)
 
 
-def _drain(gen: Generator[Match, None, ColumnOutcome], sink: Callable[[Match], None]) -> ColumnOutcome:
+def _drain(gen: Generator[Match, None, object], sink: Callable[[Match], None]):
     """Feed every yielded match to `sink`; return the generator's final outcome."""
     while True:
         try:
@@ -387,20 +443,22 @@ def search(
 
         emit()
 
-        def work(col: Column) -> None:
+        def work(unit: list[Column]) -> None:
             if token.cancelled:
                 return
-            results.put(_Started(col.owner, col.table, time.monotonic()))
+            results.put(_Started(unit[0].owner, unit[0].table, time.monotonic()))
             try:
                 with db.acquire(pool) as conn:
                     token.register(conn)
                     try:
                         if opts.time_limit:
                             conn.call_timeout = int(opts.time_limit * 1000)
-                        gen = _search_column(
-                            conn, col, pattern, flags, token, opts.limit_per_column, literal, not opts.case_sensitive
-                        )
-                        results.put(_drain(gen, results.put))
+                        args = (pattern, flags, token, opts.limit_per_column, literal, not opts.case_sensitive)
+                        if len(unit) == 1:
+                            results.put(_drain(_search_column(conn, unit[0], *args), results.put))
+                        else:
+                            for outcome in _drain(_search_table(conn, unit, *args), results.put):
+                                results.put(outcome)
                     finally:
                         token.unregister(conn)
                         if opts.time_limit:
@@ -410,11 +468,16 @@ def search(
                     return
                 if on_skip is None:
                     raise
-                results.put(_Skipped(col, exc))
+                for col in unit:
+                    results.put(_Skipped(col, exc))
 
-        total = len(columns)
-        for col in columns:
-            executor.submit(work, col).add_done_callback(lambda f, col=col: results.put((_DONE, f, col)))
+        if SINGLE_SCAN_PER_TABLE:
+            units = [cols for cols in tables.values()]
+        else:
+            units = [[col] for col in columns]
+        total = len(units)
+        for unit in units:
+            executor.submit(work, unit).add_done_callback(lambda f, unit=unit: results.put((_DONE, f, unit)))
 
         done = 0
         while done < total:
@@ -436,13 +499,13 @@ def search(
             elif isinstance(item, _Skipped):
                 on_skip(item.column, item.error)
             else:
-                _, future, col = item
+                _, future, unit = item
                 done += 1
                 error = future.exception()
                 if error is not None:
                     raise error
-                key = (col.owner, col.table)
-                columns_done[key] += 1
+                key = (unit[0].owner, unit[0].table)
+                columns_done[key] += len(unit)
                 if columns_done[key] == len(tables[key]):
                     finished.add(key)
                 emit()
