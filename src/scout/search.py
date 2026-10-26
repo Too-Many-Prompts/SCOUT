@@ -5,7 +5,7 @@ Read-only: only SELECTs are issued, over READ ONLY sessions (see scout.db).
 """
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,6 +32,8 @@ class SearchOptions:
     tables: tuple[str, ...] = ()
     tier: DictionaryTier = DictionaryTier.ALL
     threads: int = field(default_factory=default_threads)
+    # locate mode: stop each column after this many hits (None = every hit); see ColumnOutcome
+    limit_per_column: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,17 @@ class Match:
     @property
     def key(self) -> tuple[str, str, str, str]:
         return (self.owner, self.table, self.column, self.value)
+
+
+@dataclass(frozen=True)
+class ColumnOutcome:
+    """How one searched column ended. `examples` hits were returned; with a limit,
+    `more_available` says the column has hits beyond them."""
+
+    column: Column
+    examples: int
+    more_available: bool
+    timed_out: bool = False
 
 
 ProgressCallback = Callable[[int, int], None]  # (columns_done, columns_total)
@@ -126,23 +139,48 @@ def discover_columns(conn: oracledb.Connection, opts: SearchOptions) -> list[Col
 
 
 def _search_column(
-    conn: oracledb.Connection, col: Column, pattern: str, flags: str, stop: threading.Event
-) -> Iterator[Match]:
+    conn: oracledb.Connection,
+    col: Column,
+    pattern: str,
+    flags: str,
+    stop: threading.Event,
+    limit: int | None = None,
+) -> Generator[Match, None, ColumnOutcome]:
+    """Yield the column's matches (at most `limit`); returns its ColumnOutcome."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
     sql = (
         f"SELECT ROWID, {name} FROM {_quote(col.owner)}.{_quote(col.table)} "
         f"WHERE REGEXP_LIKE({name}, :pat, :flags)"
     )
+    binds: dict[str, object] = {"pat": pattern, "flags": flags}
+    if limit is not None:
+        sql += " FETCH FIRST :lim ROWS ONLY"
+        binds["lim"] = limit + 1  # one extra row tells us there are more
+    examples, more = 0, False
     with conn.cursor() as cur:
         cur.arraysize = 500
-        cur.execute(sql, pat=pattern, flags=flags)
+        cur.execute(sql, **binds)
         while not stop.is_set():
             rows = cur.fetchmany()
             if not rows:
-                return
+                break
             for rowid, value in rows:
+                if limit is not None and examples >= limit:
+                    more = True
+                    break
+                examples += 1
                 yield Match(col.owner, col.table, col.column, value, str(rowid))
+    return ColumnOutcome(col, examples, more)
+
+
+def _drain(gen: Generator[Match, None, ColumnOutcome], sink: Callable[[Match], None]) -> ColumnOutcome:
+    """Feed every yielded match to `sink`; return the generator's final outcome."""
+    while True:
+        try:
+            sink(next(gen))
+        except StopIteration as done:
+            return done.value
 
 
 def search(
@@ -151,6 +189,7 @@ def search(
     on_progress: ProgressCallback | None = None,
     on_skip: SkipCallback | None = None,
     pool: oracledb.ConnectionPool | None = None,
+    on_column: Callable[[ColumnOutcome], None] | None = None,
 ) -> Iterator[Match]:
     """Search every discovered column on opts.threads workers, yielding matches as found.
 
@@ -161,7 +200,13 @@ def search(
 
     With `pool` (a Session's pool) the search borrows from it and leaves it open, and threads
     are capped at the pool size; without it, a pool is created and closed for this call.
+
+    With opts.limit_per_column (locate mode) each column stops after that many hits. `on_column`
+    receives one ColumnOutcome per column searched, from the calling thread (skipped columns
+    go to on_skip instead).
     """
+    if opts.limit_per_column is not None and opts.limit_per_column < 1:
+        raise ValueError("limit_per_column must be at least 1")
     pattern, flags = build_regex(opts)  # validates the options before touching the database
     threads = max(1, opts.threads)
     own_pool = pool is None
@@ -184,8 +229,8 @@ def search(
                 return
             try:
                 with db.acquire(pool) as conn:
-                    for match in _search_column(conn, col, pattern, flags, stop):
-                        results.put(match)
+                    gen = _search_column(conn, col, pattern, flags, stop, opts.limit_per_column)
+                    results.put(_drain(gen, results.put))
             except oracledb.DatabaseError as exc:
                 if on_skip is None:
                     raise
@@ -199,6 +244,10 @@ def search(
             item = results.get()
             if isinstance(item, Match):
                 yield item
+                continue
+            if isinstance(item, ColumnOutcome):
+                if on_column:
+                    on_column(item)
                 continue
             if isinstance(item, _Skipped):
                 on_skip(item.column, item.error)

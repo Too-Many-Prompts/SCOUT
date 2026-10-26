@@ -66,3 +66,5 @@ ZEBRA_TEXTS = {"A zebra crossing ahead"}  # whole word 'zebra'
 ZEBRA_CONTAINS_TEXTS = ZEBRA_TEXTS | {"Zebras graze at dawn"}  # default (contains)
 
 BROKEN = ("SCOUT_BROKEN", "EXT_MISSING", "TXT")  # visible in the catalog, fails when queried
+
+LATE_HIT = ("SCOUT_ODD", "LATE_HIT", "TXT")  # single hit 'lateneedle', in the last of 200 rows

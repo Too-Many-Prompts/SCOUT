@@ -75,6 +75,11 @@ INSERT INTO scout_odd."MixedCase Table" VALUES (2, 'color');
 INSERT INTO scout_odd."MixedCase Table" VALUES (3, 'Colorado');
 INSERT INTO scout_odd."MixedCase Table" VALUES (4, 'The colors are bright');
 INSERT INTO scout_odd."MixedCase Table" VALUES (5, 'it''s a ''quoted'' value');
+-- the only hit is the last of 200 rows: locate mode must still report this column
+CREATE TABLE scout_odd.late_hit (id NUMBER, txt VARCHAR2(100));
+INSERT INTO scout_odd.late_hit
+  SELECT LEVEL, CASE WHEN LEVEL = 200 THEN 'the lateneedle arrives' ELSE 'filler text row' END
+    FROM dual CONNECT BY LEVEL <= 200;
 CREATE TABLE scout_odd.nums (n NUMBER, d DATE);
 INSERT INTO scout_odd.nums VALUES (42, DATE '2024-01-01');
 
@@ -102,4 +107,5 @@ GRANT SELECT ON scout_docs.indexed_notes     TO scout_reader;
 GRANT SELECT ON scout_docs.plain_notes       TO scout_reader;
 GRANT SELECT ON scout_odd."MixedCase Table"  TO scout_reader;
 GRANT SELECT ON scout_odd.nums               TO scout_reader;
+GRANT SELECT ON scout_odd.late_hit           TO scout_reader;
 GRANT SELECT ON scout_broken.ext_missing     TO scout_reader;
