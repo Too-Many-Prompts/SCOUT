@@ -77,6 +77,7 @@ class Session:
     cfg: ConnectionConfig
     schemas: tuple[str, ...]
     pool: oracledb.ConnectionPool
+    last_opts: object | None = None  # the shell's most recent SearchOptions, for `more`
 
     def close(self) -> None:
         self.pool.close(force=True)

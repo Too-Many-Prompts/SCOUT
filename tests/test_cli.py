@@ -36,7 +36,9 @@ def test_search_writes_csv(tmp_path, reader_config):
     )
     assert result.exit_code == 0, result.output
     lines = out.read_text().splitlines()
-    assert lines[0] == "owner,table,column,value" and len(lines) == 4
+    # locate mode labels the file: every column here fit within the limit, so all rows are complete
+    assert lines[0] == "owner,table,column,value,complete" and len(lines) == 4
+    assert all(line.endswith(",yes") for line in lines[1:])
     assert "SCOUT_HR.EMPLOYEES.NOTES" in result.stdout
 
 
@@ -87,7 +89,7 @@ def _fake_session(monkeypatch, fail=None):
             raise fail
         return db.Session(cfg, schemas, MagicMock(name="pool"))
 
-    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None):
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
         searches.append((opts, pool))
         yield Match("O", "T", "C", "hit " + opts.terms[0])
 
@@ -181,3 +183,184 @@ def test_bare_wildcard_is_refused_before_any_prompt():
         result = runner.invoke(app, ["search", term])
         assert result.exit_code == 2, term
         assert "wildcard" in result.output and "Username" not in result.output
+
+
+# ---- locate mode in the CLI and shell
+
+def _located(monkeypatch, outcomes=(), skips=(), hits=(), raise_interrupt=False, sink=None):
+    """Replace cli.run_search with a fake that reports the given matches/outcomes/skips."""
+    from scout import cli
+
+    calls = sink if sink is not None else []
+
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, on_column=None, cancel=None, **kw):
+        calls.append({"opts": opts, "pool": pool, "cancel": cancel})
+        if raise_interrupt:
+            raise KeyboardInterrupt
+        yield from hits
+        for o in outcomes:
+            on_column(o)
+        for col, exc in skips:
+            on_skip(col, exc)
+
+    monkeypatch.setattr(cli, "run_search", fake_search)
+    return calls
+
+
+ENV = {"SCOUT_TEST_DB_USER": "u", "SCOUT_TEST_DB_PASSWORD": "p"}
+
+
+def _col(name="A"):
+    from scout.search import Column
+
+    return Column("O", "T", name, "VARCHAR2")
+
+
+def _outcome(name="A", examples=5, more=True, timed_out=False):
+    from scout.search import ColumnOutcome
+
+    return ColumnOutcome(_col(name), examples, more, timed_out)
+
+
+def _hits(*names):
+    from scout.search import Match
+
+    return [Match("O", "T", n, f"value in {n}") for n in names]
+
+
+def test_default_search_is_locate_mode_with_a_where_found_summary(monkeypatch):
+    calls = _located(monkeypatch, outcomes=[_outcome("A", 5, True), _outcome("B", 2, False)],
+                     hits=_hits("A", "B"))
+    result = runner.invoke(app, ["search", "x", "--non-interactive"], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert calls[0]["opts"].limit_per_column == 5 and calls[0]["opts"].time_limit == 300.0
+    summary = result.output.split("Where it was found")[1]
+    assert "O.T.A" in summary and "5 example" in summary and "(more available)" in summary
+    assert "O.T.B" in summary and summary.count("(more available)") == 1
+    assert 'scout search x --column "O.T.A"' in summary  # the exact drill-down command
+
+
+def test_all_flag_means_every_hit_and_no_time_limit(monkeypatch):
+    calls = _located(monkeypatch, outcomes=[_outcome("A", 7, False)], hits=_hits("A"))
+    result = runner.invoke(app, ["search", "x", "--all", "--non-interactive"], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert calls[0]["opts"].limit_per_column is None and calls[0]["opts"].time_limit is None
+    assert "(more available)" not in result.output
+
+
+def test_time_limit_option_applies_in_either_mode(monkeypatch):
+    calls = _located(monkeypatch)
+    runner.invoke(app, ["search", "x", "--time-limit", "12.5", "--non-interactive"], env=ENV)
+    runner.invoke(app, ["search", "x", "--all", "--time-limit", "30", "--non-interactive"], env=ENV)
+    assert [c["opts"].time_limit for c in calls] == [12.5, 30.0]
+    assert runner.invoke(app, ["search", "x", "--time-limit", "0", "--non-interactive"], env=ENV).exit_code == 2
+
+
+def test_locate_csv_has_a_complete_column_and_a_notice_all_does_not(monkeypatch, tmp_path):
+    _located(monkeypatch, outcomes=[_outcome("A", 5, True), _outcome("B", 1, False)], hits=_hits("A", "B"))
+    out = tmp_path / "loc.csv"
+    result = runner.invoke(app, ["search", "x", "--non-interactive", "--csv", str(out)], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert out.read_text().splitlines() == [
+        "owner,table,column,value,complete", "O,T,A,value in A,no", "O,T,B,value in B,yes"]
+    assert "examples" in result.output and "--all" in result.output  # the file is labelled as examples
+    full = tmp_path / "all.csv"
+    _located(monkeypatch, outcomes=[_outcome("A", 7, False)], hits=_hits("A"))  # --all: nothing is cut off
+    runner.invoke(app, ["search", "x", "--all", "--non-interactive", "--csv", str(full)], env=ENV)
+    assert full.read_text().splitlines()[0] == "owner,table,column,value"
+
+
+def test_timed_out_columns_are_never_reported_as_empty(monkeypatch):
+    from scout.search import ColumnTimeout
+
+    _located(monkeypatch,
+             outcomes=[_outcome("EMPTY", 0, False, timed_out=True), _outcome("PART", 2, False, timed_out=True)],
+             skips=[(_col("EMPTY"), ColumnTimeout("timed out after 300 s"))], hits=_hits("PART", "PART"))
+    result = runner.invoke(app, ["search", "x", "--non-interactive"], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert "Timed out" in result.output and "O.T.EMPTY" in result.output
+    assert "Skipped" not in result.output  # a timeout is not a failure to search
+    assert "(partial: timed out)" in result.output.split("Where it was found")[1]
+
+
+def test_ctrl_c_cancels_and_exits_130(monkeypatch):
+    calls = _located(monkeypatch, raise_interrupt=True)
+    result = runner.invoke(app, ["search", "x", "--non-interactive"], env=ENV)
+    assert result.exit_code == 130 and "Cancelled" in result.output
+    assert calls[0]["cancel"].cancelled
+
+
+def _drill_fakes(monkeypatch, known=("O.T.A",), logins=None):
+    from unittest.mock import MagicMock
+
+    from scout import cli, db
+    from scout.search import Column, Match
+
+    drilled = []
+
+    def open_session(cfg, schemas, threads):
+        (logins if logins is not None else []).append(cfg)
+        return db.Session(cfg, schemas, MagicMock(name="pool"))
+
+    def fake_resolve(conn, ref, opts):
+        return Column("O", "T", "A", "VARCHAR2") if ref in known else None
+
+    def fake_drill(pool, column, opts, cancel=None):
+        drilled.append((column, opts, cancel))
+        yield Match("O", "T", "A", "every hit 1")
+        yield Match("O", "T", "A", "every hit 2")
+
+    monkeypatch.setattr(db, "open_session", open_session)
+    monkeypatch.setattr(db, "acquire", lambda pool: MagicMock(__enter__=lambda s: MagicMock(), __exit__=lambda *a: False))
+    monkeypatch.setattr(cli, "resolve_column", fake_resolve)
+    monkeypatch.setattr(cli, "drill_down", fake_drill)
+    return drilled
+
+
+def test_column_option_prints_every_hit_for_one_column(monkeypatch):
+    drilled = _drill_fakes(monkeypatch)
+    result = runner.invoke(app, ["search", "x", "--column", "O.T.A", "--non-interactive"], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert "every hit 1" in result.stdout and "every hit 2" in result.stdout
+    column, opts, _ = drilled[0]
+    assert opts.limit_per_column is None and opts.time_limit is None and opts.terms == ("x",)
+
+
+def test_unknown_column_exits_2_with_a_clear_message(monkeypatch):
+    _drill_fakes(monkeypatch)
+    result = runner.invoke(app, ["search", "x", "--column", "O.T.NOPE", "--non-interactive"], env=ENV)
+    assert result.exit_code == 2 and "No searchable column" in result.output and "Traceback" not in result.output
+
+
+def test_shell_more_reuses_the_last_search_and_survives_mistakes(monkeypatch):
+    calls = _located(monkeypatch, outcomes=[_outcome("A", 5, True)], hits=_hits("A"))
+    drilled = _drill_fakes(monkeypatch)  # also fakes db.open_session
+    login = "h\n1521\nme\npw\nSVC\n\n"
+    result = runner.invoke(app, [], input=login + "more O.T.A\nsearch alpha --whole-word\nmore O.T.NOPE\nmore O.T.A\nexit\n")
+    assert result.exit_code == 0, result.output
+    assert "Run a search first" in result.output          # before any search
+    assert "No searchable column" in result.output         # unknown ref: stays in the shell
+    column, opts, _ = drilled[0]
+    assert opts.terms == ("alpha",) and opts.whole_word and opts.limit_per_column is None
+    assert 'more O.T.A' in result.output                     # the hint names the shell command
+
+
+def test_shell_survives_ctrl_c_during_a_search(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from scout import cli, db
+    from scout.search import Match
+
+    monkeypatch.setattr(db, "open_session", lambda cfg, schemas, threads: db.Session(cfg, schemas, MagicMock()))
+    seen = []
+
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, on_column=None, cancel=None, **kw):
+        seen.append(opts.terms[0])
+        if opts.terms[0] == "a":
+            raise KeyboardInterrupt
+        yield Match("O", "T", "C", "found b")
+
+    monkeypatch.setattr(cli, "run_search", fake_search)
+    result = runner.invoke(app, [], input="h\n1521\nme\npw\nSVC\n\nsearch a\nsearch b\nexit\n")
+    assert result.exit_code == 0, result.output
+    assert seen == ["a", "b"] and "Cancelled" in result.output and "found b" in result.stdout

@@ -7,6 +7,8 @@ DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 1521
 DEFAULT_SERVICE_NAME = "FREEPDB1"
 DEFAULT_THREADS = 8
+DEFAULT_LOCATE_LIMIT = 5  # example hits per column in the CLI, shell and TUI (--all lifts it)
+DEFAULT_TIME_LIMIT = 300.0  # seconds a locate-mode query may run before its column "times out"
 DEFAULTS_FILE = "defaults.txt"
 _FILE_KEYS = {"host", "port", "service_name", "schema", "threads"}  # never user/password
 

@@ -97,7 +97,7 @@ async def test_two_searches_share_one_login_and_pool(monkeypatch):
     calls = fake_login(monkeypatch)
     pools = []
 
-    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None):
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
         pools.append(pool)
         yield Match("O", "T", "C", "hit")
 
@@ -159,7 +159,7 @@ async def test_second_search_cancels_first_without_mixing_results(monkeypatch):
 
     release = threading.Event()
 
-    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None):
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
         if opts.terms == ("first",):
             yield Match("OLD", "T", "C", "a")
             release.wait(5)  # still running when the second search starts
@@ -188,7 +188,7 @@ async def test_skipped_columns_are_listed_after_the_search(monkeypatch):
     from scout import search as search_core
     from scout.search import Column, Match
 
-    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None):
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
         yield Match("O", "T", "C", "hit")
         on_skip(Column("O", "BAD", "TXT", "VARCHAR2"), Exception("ORA-29913: boom\nmore"))
 
@@ -212,7 +212,7 @@ async def test_whole_word_and_near_fields_build_the_search_options(monkeypatch):
     fake_login(monkeypatch)
     seen = []
 
-    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None):
+    def fake_search(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
         seen.append(opts)
         return iter(())
 
