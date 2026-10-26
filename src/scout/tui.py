@@ -205,9 +205,9 @@ class ScoutApp(App):
         """Runs off the event loop; every UI touch goes through call_from_thread."""
         worker = get_current_worker()
 
-        def progress(done: int, total: int) -> None:
+        def progress(p) -> None:
             if not worker.is_cancelled:
-                self.call_from_thread(self._status, f"Searching {done}/{total} columns")
+                self.call_from_thread(self._status, f"Searching {p.columns_done}/{p.columns_total} columns")
 
         try:
             def on_skip(col, exc) -> None:

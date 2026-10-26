@@ -9,6 +9,7 @@ import typer
 from typer.exceptions import TyperException
 
 from scout import db
+from scout.control import Progress
 from scout.config import ConnectionConfig, default_schemas, default_threads, load_defaults
 from scout.export import write_csv
 from scout.pattern import build_regex
@@ -143,9 +144,9 @@ def search(
     skipped: list[tuple[Column, Exception]] = []
     columns_searched = 0
 
-    def progress(done: int, total: int) -> None:
+    def progress(p: Progress) -> None:
         nonlocal columns_searched
-        columns_searched = total
+        columns_searched = p.columns_total
 
     try:
         for m in run_search(cfg, opts, progress, lambda col, exc: skipped.append((col, exc)), pool):

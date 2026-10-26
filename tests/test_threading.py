@@ -20,8 +20,10 @@ def test_serial_and_parallel_return_identical_matches(reader_config):
 def test_progress_callback_reaches_total(reader_config):
     seen = []
     opts = SearchOptions(terms=("report",), schemas=ex.SCHEMAS, threads=4)
-    list(search(reader_config, opts, on_progress=lambda done, total: seen.append((done, total))))
-    assert seen and seen[-1][0] == seen[-1][1]
+    list(search(reader_config, opts, on_progress=seen.append))
+    last = seen[-1]
+    assert last.columns_done == last.columns_total > 0
+    assert last.tables_done == last.tables_total and last.fraction == 1.0
 
 
 def test_worker_error_propagates(reader_config):
