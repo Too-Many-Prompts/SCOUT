@@ -364,3 +364,24 @@ def test_shell_survives_ctrl_c_during_a_search(monkeypatch):
     result = runner.invoke(app, [], input="h\n1521\nme\npw\nSVC\n\nsearch a\nsearch b\nexit\n")
     assert result.exit_code == 0, result.output
     assert seen == ["a", "b"] and "Cancelled" in result.output and "found b" in result.stdout
+
+
+def test_a_timed_out_drill_down_is_reported_as_partial_and_the_csv_says_so(monkeypatch, tmp_path):
+    from scout import cli
+    from scout.search import ColumnTimeout, Match
+
+    _drill_fakes(monkeypatch)
+
+    def timing_out(pool, column, opts, cancel=None):
+        yield Match("O", "T", "A", "found before the clock ran out")
+        raise ColumnTimeout("timed out after 5 s")
+
+    monkeypatch.setattr(cli, "drill_down", timing_out)
+    out = tmp_path / "partial.csv"
+    result = runner.invoke(
+        app, ["search", "x", "--column", "O.T.A", "--time-limit", "5", "--non-interactive", "--csv", str(out)], env=ENV)
+    assert result.exit_code == 0, result.output
+    assert "Timed out" in result.output and "partial" in result.output
+    assert "every hit" not in result.stdout
+    assert out.read_text().splitlines() == [
+        "owner,table,column,value,complete", "O,T,A,found before the clock ran out,no"]

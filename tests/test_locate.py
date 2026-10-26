@@ -305,3 +305,39 @@ def test_single_scan_stops_early_once_every_column_has_enough_hits():
     assert len(fetched) == 2  # row 1 fills each column, row 2 proves 'more'; the rest is never read
     assert [(o.examples, o.more_available) for o in outcomes] == [(1, True), (1, True)]
     assert len(got) == 2
+
+
+@pytest.mark.parametrize("nls", [
+    "NLS_SORT=TURKISH NLS_COMP=LINGUISTIC",
+    "NLS_LANGUAGE=TURKISH NLS_TERRITORY=TURKEY",
+    "NLS_SORT=GERMAN",
+])
+def test_case_folding_proof_holds_under_other_nls_settings(reader_config, nls):
+    """The pre-check and pruning rely on how REGEXP_LIKE(..., 'i') folds case. A user's session
+    may use other NLS settings (client NLS_LANG); re-run the sweep and the ligature pairs under them."""
+    from scout import db
+    from scout.pattern import _SAFE_FOLD
+
+    conn = db.connect(reader_config, read_only=False)  # only to ALTER SESSION; nothing is written
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER SESSION SET {nls}")
+            cur.execute("SELECT value FROM nls_session_parameters WHERE parameter IN ('NLS_SORT', 'NLS_LANGUAGE')")
+            sql = """
+                SELECT cp FROM (SELECT LEVEL + 31 AS cp FROM dual CONNECT BY LEVEL <= 65504)
+                 WHERE cp NOT BETWEEN 55296 AND 57343
+                   AND REGEXP_LIKE(UNISTR('\\' || LPAD(TRIM(TO_CHAR(cp, 'XXXX')), 4, '0')), :c, 'i')
+                   AND INSTR(NLS_LOWER(UNISTR('\\' || LPAD(TRIM(TO_CHAR(cp, 'XXXX')), 4, '0')), 'NLS_SORT=BINARY'), :c) = 0"""
+            missed = {}
+            for ch in sorted(_SAFE_FOLD):
+                cur.execute(sql, c=ch)
+                rows = cur.fetchall()
+                if rows:
+                    missed[ch] = [hex(r[0]) for r in rows]
+            assert missed == {}, f"pre-check can miss hits under {nls}"
+            # the multi-character folds that pruning allows for must still hold
+            for text, pat in [("ß", "ss"), ("ﬁ", "fi"), ("ﬃ", "ffi"), ("K", "k"), ("ſ", "s")]:
+                cur.execute("SELECT CASE WHEN REGEXP_LIKE(:t, :p, 'i') THEN 1 ELSE 0 END FROM dual", t=text, p=pat)
+                assert cur.fetchone()[0] == 1, (text, pat, nls)
+    finally:
+        conn.close()

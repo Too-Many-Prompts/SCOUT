@@ -14,7 +14,7 @@ command and the TUI search/export, locate mode with drill-down, cancel, time lim
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 294 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
+Status: 311 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -43,12 +43,19 @@ Status: 294 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run se
   contract tests see complete results. Every searched column reports one `ColumnOutcome`
   (`on_column`); `drill_down` / `resolve_column` / `--column REF` / shell `more REF` / TUI "Show all
   hits" fetch every hit for one column. Locate-mode CSV gains a `complete` column (`no` = examples only).
-- **Time limit:** locate-mode queries get 300 s (`DEFAULT_TIME_LIMIT`; `--time-limit`). A column that
-  runs out is `ColumnOutcome.timed_out`; with no hits it also goes to `on_skip` as `ColumnTimeout`, so a
-  timeout is never presented as "no hits". `--all` and drill-down have no limit unless asked.
+- **Time limit:** locate-mode queries get 300 s (`DEFAULT_TIME_LIMIT`; `--time-limit`). It is a deadline for
+  the whole query: the driver's `call_timeout` covers only one round trip, so `_search_column` re-arms it
+  with the time left before every fetch. A column that runs out is `ColumnOutcome.timed_out`; with no hits
+  it also goes to `on_skip` as `ColumnTimeout` (raised if there is no `on_skip`), so a timeout is never
+  presented as "no hits". `--all` and drill-down have no limit unless asked; a drill-down that times out
+  yields its hits and then raises `ColumnTimeout`, and the CLI/TUI label the result partial.
+- **Outcomes are honest about being cut short:** a column stopped by cancel returns `more_available=True`
+  (never "complete"); the TUI labels an export `complete=no` for every row after a cancel or timeout.
 - **Cancel:** `CancelToken` (`control.py`) stops a search promptly and interrupts statements already
-  running on the server (`Connection.cancel()` -> ORA-01013, swallowed). CLI/shell: Ctrl+C; TUI:
-  Cancel button or Esc. `Progress` (size-weighted fraction, in-flight tables with elapsed time, hits)
+  running on the server (`Connection.cancel()` -> ORA-01013, swallowed), re-sends the interrupt every
+  heartbeat while draining (a statement can start just after `cancel()`), and also covers the dictionary
+  query. An ORA-01013 we did not cause is treated as the user's Ctrl+C: the Oracle client breaks running
+  statements on SIGINT even when Python never sees it. CLI/shell: Ctrl+C (exit 130); TUI: Cancel or Esc. `Progress` (size-weighted fraction, in-flight tables with elapsed time, hits)
   is sent on every finished column and at least once a second.
 - **Oracle's case-insensitive regex folds more than ASCII case** (measured): Kelvin sign = k, long s = s,
   and one character can match several letters (sharp s = ss, ligatures = fi, ffi, ff, fl, st). Two things
@@ -56,7 +63,8 @@ Status: 294 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run se
   3 characters fold into 1 when case-insensitive, and `pattern.required_literal` (the substring
   pre-check) only uses ASCII pieces free of `s` and of possible ligature pairs, tested with
   `NLS_LOWER(col, 'NLS_SORT=BINARY')`. Both are proved by tests (a whole-BMP sweep and equivalence over the
-  seed's `Unicode Edge` table); do not loosen them without extending those tests.
+  seed's `Unicode Edge` table, and re-run under Turkish/German NLS settings, which change nothing); do not
+  loosen them without extending those tests.
 - **Speed (benchmark, 20 tables x 50k rows, 140 columns, in cache):** the regex is the cost, not the scan.
   The pre-check is nested in `CASE WHEN INSTR(..) > 0 THEN CASE WHEN REGEXP_LIKE(..)` because Oracle does
   not evaluate `AND` terms in order (measured): a no-hit search went from 59.5 s to 3.3 s. Single scan per

@@ -205,11 +205,15 @@ def _search_column(
     limit: int | None = None,
     literal: str | None = None,
     fold: bool = False,
+    deadline: float | None = None,
 ) -> Generator[Match, None, ColumnOutcome]:
     """Yield the column's matches (at most `limit`); returns its ColumnOutcome.
 
     `literal` (from pattern.required_literal) adds a cheap substring test ahead of the regex;
-    `fold` says the search is case-insensitive, so the column is lowercased first."""
+    `fold` says the search is case-insensitive, so the column is lowercased first. `deadline`
+    (time.monotonic() value) caps the whole query: call_timeout limits one round trip, so it is
+    re-armed with the time left before every fetch. A column cut short by `stop` is returned as
+    `more_available`, never as complete."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
     binds: dict[str, object] = {"pat": pattern, "flags": flags}
@@ -221,11 +225,20 @@ def _search_column(
         sql += " FETCH FIRST :lim ROWS ONLY"
         binds["lim"] = limit + 1  # one extra row tells us there are more
     examples, more = 0, False
+    if stop.is_set():  # cancelled before the statement could start: do not start it
+        return ColumnOutcome(col, 0, True)
     try:
         with conn.cursor() as cur:
             cur.arraysize = 500
+            if not _arm(conn, deadline):
+                return ColumnOutcome(col, 0, False, timed_out=True)
             cur.execute(sql, **binds)
-            while not stop.is_set():
+            while True:
+                if stop.is_set():
+                    more = True  # cut short: there may be hits we never read
+                    break
+                if not _arm(conn, deadline):
+                    return ColumnOutcome(col, examples, more, timed_out=True)
                 rows = cur.fetchmany()
                 if not rows:
                     break
@@ -242,6 +255,17 @@ def _search_column(
     return ColumnOutcome(col, examples, more)
 
 
+def _arm(conn: oracledb.Connection, deadline: float | None) -> bool:
+    """Set the driver's per-call timeout to the time left before `deadline`; False if none is left."""
+    if deadline is None:
+        return True
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return False
+    conn.call_timeout = max(1, int(left * 1000))
+    return True
+
+
 def _search_table(
     conn: oracledb.Connection,
     cols: list[Column],
@@ -251,6 +275,7 @@ def _search_table(
     limit: int | None = None,
     literal: str | None = None,
     fold: bool = False,
+    deadline: float | None = None,
 ) -> Generator[Match, None, list[ColumnOutcome]]:
     """Search every column of one table in a single scan; returns one ColumnOutcome per column.
 
@@ -266,11 +291,21 @@ def _search_table(
     select = ", ".join(f"CASE WHEN {c} THEN {n} END" for c, n in zip(conds, names))
     sql = f"SELECT ROWID, {select} FROM {owner}.{table} WHERE {' OR '.join(conds)}"
     counts, more, timed_out = [0] * len(cols), [False] * len(cols), False
+    if stop.is_set():
+        return [ColumnOutcome(c, 0, True) for c in cols]
     try:
         with conn.cursor() as cur:
             cur.arraysize = 500
+            if not _arm(conn, deadline):
+                return [ColumnOutcome(c, 0, False, timed_out=True) for c in cols]
             cur.execute(sql, **binds)
-            while not stop.is_set():
+            while True:
+                if stop.is_set():
+                    more = [True] * len(cols)  # cut short: there may be hits we never read
+                    break
+                if not _arm(conn, deadline):
+                    timed_out = True
+                    break
                 rows = cur.fetchmany()
                 if not rows:
                     break
@@ -318,8 +353,11 @@ def drill_down(
     cancel: CancelToken | None = None,
 ) -> Iterator[Match]:
     """Every hit for one column (opts.limit_per_column is ignored), streamed from one
-    borrowed read-only connection. Closing the generator or cancelling stops the fetch;
-    opts.time_limit (off by default here) ends it early and keeps what was found."""
+    borrowed read-only connection. Closing the generator or cancelling stops the fetch.
+
+    opts.time_limit (off by default here) caps the whole fetch; when it runs out, the hits found
+    are yielded first and then ColumnTimeout is raised, so a partial list is never mistaken
+    for every hit."""
     pattern, flags = build_regex(opts)
     literal = required_literal(opts) if PRECHECK else None
     token = CancelToken()
@@ -331,21 +369,24 @@ def drill_down(
         with db.acquire(pool) as conn:
             token.register(conn)
             try:
-                if opts.time_limit:
-                    conn.call_timeout = int(opts.time_limit * 1000)
-                gen = _search_column(conn, column, pattern, flags, token, None, literal, not opts.case_sensitive)
+                deadline = time.monotonic() + opts.time_limit if opts.time_limit else None
+                gen = _search_column(
+                    conn, column, pattern, flags, token, None, literal, not opts.case_sensitive, deadline
+                )
+                outcome = None
                 try:
-                    yield from gen
-                except oracledb.DatabaseError:
-                    if not token.cancelled:  # an interrupted statement is not an error
-                        raise
+                    outcome = yield from gen
+                except oracledb.DatabaseError as exc:
+                    if not token.cancelled and _error_code(exc) not in CANCEL_CODES:
+                        raise  # an interrupted statement (cancel / Ctrl+C) just ends the fetch
                 finally:
-                    token.cancel()
                     gen.close()
             finally:
                 token.unregister(conn)
                 if opts.time_limit:
                     conn.call_timeout = 0
+            if outcome is not None and outcome.timed_out:
+                raise ColumnTimeout(f"timed out after {opts.time_limit:g} s")
     finally:
         if cancel is not None:
             cancel.unlink(token)
@@ -406,8 +447,14 @@ def search(
     results: queue.Queue = queue.Queue()
     executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="scout")
     try:
+        if on_progress:  # "looking for tables": the dictionary query can take a while
+            on_progress(Progress(0, 0, 0.0, (), 0, 0, 0))
         with db.acquire(pool) as conn:
-            columns = prune_columns(discover_columns(conn, opts), opts)
+            token.register(conn)  # so cancel() can interrupt a slow dictionary query too
+            try:
+                columns = prune_columns(discover_columns(conn, opts), opts)
+            finally:
+                token.unregister(conn)
 
         tables: dict[tuple[str, str], list[Column]] = {}
         for col in columns:
@@ -452,9 +499,8 @@ def search(
                 with db.acquire(pool) as conn:
                     token.register(conn)
                     try:
-                        if opts.time_limit:
-                            conn.call_timeout = int(opts.time_limit * 1000)
-                        args = (pattern, flags, token, opts.limit_per_column, literal, not opts.case_sensitive)
+                        deadline = time.monotonic() + opts.time_limit if opts.time_limit else None
+                        args = (pattern, flags, token, opts.limit_per_column, literal, not opts.case_sensitive, deadline)
                         if len(unit) == 1:
                             results.put(_drain(_search_column(conn, unit[0], *args), results.put))
                         else:
@@ -492,6 +538,8 @@ def search(
             try:
                 item = results.get(timeout=HEARTBEAT_SECONDS)
             except queue.Empty:
+                if token.cancelled:
+                    token.break_running()  # a statement may have started just after cancel()
                 emit()
                 continue
             if isinstance(item, Match):
@@ -502,8 +550,11 @@ def search(
             elif isinstance(item, ColumnOutcome):
                 if on_column:
                     on_column(item)
-                if item.timed_out and not item.examples and on_skip:
-                    on_skip(item.column, ColumnTimeout(f"timed out after {opts.time_limit:g} s"))
+                if item.timed_out and not item.examples:
+                    timeout = ColumnTimeout(f"timed out after {opts.time_limit:g} s")
+                    if on_skip is None:
+                        raise timeout  # no way to report it, and a timeout must never look like "no hits"
+                    on_skip(item.column, timeout)
             elif isinstance(item, _Skipped):
                 on_skip(item.column, item.error)
             else:

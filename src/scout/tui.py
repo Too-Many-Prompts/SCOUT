@@ -20,7 +20,7 @@ from scout.config import (
 )
 from scout.control import CancelToken, Progress
 from scout.export import write_csv
-from scout.search import Column, ColumnOutcome, Match, SearchOptions
+from scout.search import Column, ColumnOutcome, ColumnTimeout, Match, SearchOptions
 
 
 class LoginScreen(Screen):
@@ -126,6 +126,8 @@ class ScoutApp(App):
         self.outcomes: dict[str, ColumnOutcome] = {}  # by "OWNER.TABLE.COLUMN"
         self.opts: SearchOptions | None = None  # the last search, for "Show all hits"
         self.limited = False  # results are examples (locate mode), not every hit
+        self.cut_off: set[tuple[str, str, str]] = set()  # columns with more hits than shown / timed out
+        self.partial = False  # the run was cancelled or timed out: whatever is listed is not everything
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -229,6 +231,8 @@ class ScoutApp(App):
         self.matches = []
         self.skipped = 0
         self.outcomes = {}
+        self.cut_off = set()
+        self.partial = False
         self.opts = opts
         self.limited = opts.limit_per_column is not None
         self.token = CancelToken()
@@ -279,7 +283,8 @@ class ScoutApp(App):
     def _finished(self, cancelled: bool) -> None:
         n = len(self.matches)
         if cancelled:
-            self._status(f"Cancelled: {n} match(es) so far")
+            self.partial = True
+            self._status(f"Cancelled: {n} match(es) so far (partial)")
             return
         more = sum(1 for o in self.outcomes.values() if o.more_available)
         note = f"; {more} column(s) have more, select one and press Show all hits" if more else ""
@@ -298,6 +303,8 @@ class ScoutApp(App):
     def _add_outcome(self, outcome: ColumnOutcome) -> None:
         ref = self._ref(outcome.column)
         self.outcomes[ref] = outcome
+        if outcome.more_available or outcome.timed_out:
+            self.cut_off.add((outcome.column.owner, outcome.column.table, outcome.column.column))
         if not outcome.examples:
             return
         note = "partial: timed out" if outcome.timed_out else "more available" if outcome.more_available else ""
@@ -324,6 +331,8 @@ class ScoutApp(App):
         self.token = CancelToken()
         self.matches = []
         self.limited = False  # a single column, complete: exports without the complete column
+        self.cut_off = set()
+        self.partial = False
         self.query_one("#results", DataTable).clear()
         self._status(f"Fetching every hit in {ref}...")
         every = replace(self.opts, limit_per_column=None, time_limit=None)
@@ -337,14 +346,24 @@ class ScoutApp(App):
                 if worker.is_cancelled:
                     return
                 self.call_from_thread(self._add_match, m)
+        except ColumnTimeout as exc:  # hits found are kept, but the list is not every hit
+            if not worker.is_cancelled:
+                self.call_from_thread(self._drill_partial, f"Timed out ({exc}): {len(self.matches)} hit(s) in {ref} "
+                                      "so far (partial)")
+            return
         except Exception as exc:
             if not worker.is_cancelled:
                 self.call_from_thread(self._status, f"Error: {exc}")
             return
         if not worker.is_cancelled:
-            text = (f"Cancelled: {len(self.matches)} hit(s) in {ref} so far" if token.cancelled
-                    else f"All {len(self.matches)} hit(s) in {ref}")
-            self.call_from_thread(self._status, text)
+            if token.cancelled:
+                self.call_from_thread(self._drill_partial, f"Cancelled: {len(self.matches)} hit(s) in {ref} so far (partial)")
+            else:
+                self.call_from_thread(self._status, f"All {len(self.matches)} hit(s) in {ref}")
+
+    def _drill_partial(self, text: str) -> None:
+        self.partial = True
+        self._status(text)
 
     def _add_skipped(self, col, exc) -> None:
         self.skipped += 1
@@ -361,21 +380,30 @@ class ScoutApp(App):
 
     def export_csv(self) -> None:
         path = self._value("csv_path") or "scout_results.csv"
-        cut_off = {(o.column.owner, o.column.table, o.column.column)
-                   for o in self.outcomes.values() if o.more_available or o.timed_out}
-        labelled = self.limited or bool(cut_off)
+        if self.partial:  # cancelled or timed out: every row came from an unfinished search
+            incomplete = {(m.owner, m.table, m.column) for m in self.matches}
+        else:
+            incomplete = self.cut_off
+        labelled = self.limited or self.partial or bool(incomplete)
         try:
             with open(path, "w", newline="") as fp:
-                n = write_csv(self.matches, fp, cut_off if labelled else None)
+                n = write_csv(self.matches, fp, incomplete if labelled else None)
         except OSError as exc:
             self._status(f"Export failed: {exc}")
             return
-        note = " (examples only for columns marked complete=no; use Show all hits for the rest)" if cut_off else ""
+        if self.partial:
+            note = " (partial: the search was cancelled or timed out)"
+        elif incomplete:
+            note = " (examples only for columns marked complete=no; use Show all hits for the rest)"
+        else:
+            note = ""
         self._status(f"Wrote {n} row(s) to {path}{note}")
 
 
 def _progress_text(p: Progress) -> str:
     """One status line: how far along, hits so far, and the table taking longest."""
+    if p.columns_total == 0 and p.fraction < 1:
+        return "Looking for tables..."
     text = f"Searching {p.fraction:.0%} ({p.columns_done}/{p.columns_total} columns) · {p.hits} hits"
     if p.in_flight:
         name, secs = p.in_flight[0]

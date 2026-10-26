@@ -455,3 +455,91 @@ async def test_timed_out_columns_are_listed_as_timed_out(monkeypatch):
         await pilot.pause()
         skipped = app.query_one("#skipped", DataTable)
         assert skipped.display and "timed out" in str(skipped.get_row_at(0)[1])
+
+
+async def test_export_after_show_all_hits_is_a_complete_unlabelled_file(monkeypatch, tmp_path):
+    from scout import search as search_core
+    from scout.search import Match
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, outcomes=[_outcome("A", 5, True)], hits=[Match("O", "T", "A", "a1")])
+    monkeypatch.setattr(search_core, "drill_down",
+                        lambda pool, column, opts, cancel=None: iter([Match("O", "T", "A", f"h{i}") for i in range(3)]))
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        app.query_one("#csv_path").value = str(tmp_path / "all.csv")
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#found", DataTable).move_cursor(row=0)
+        await pilot.click("#show-all")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#export")
+        await pilot.pause()
+        status = str(app.query_one("#status").render())
+    lines = (tmp_path / "all.csv").read_text().splitlines()
+    assert lines[0] == "owner,table,column,value" and len(lines) == 4  # complete: no 'complete' column
+    assert "examples" not in status
+
+
+async def test_export_after_a_cancelled_search_is_labelled_partial(monkeypatch, tmp_path):
+    import threading
+
+    from scout.search import Match
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, hits=[Match("O", "T", "A", "a1")], hold=threading.Event())
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        app.query_one("#all_hits").value = True  # even in every-hit mode a cancelled run is partial
+        app.query_one("#csv_path").value = str(tmp_path / "part.csv")
+        await pilot.click("#search")
+        await pilot.pause(0.3)
+        await pilot.click("#cancel")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#export")
+        await pilot.pause()
+        status = str(app.query_one("#status").render())
+    assert (tmp_path / "part.csv").read_text().splitlines() == [
+        "owner,table,column,value,complete", "O,T,A,a1,no"]
+    assert "partial" in status
+
+
+async def test_a_timed_out_show_all_is_reported_as_partial(monkeypatch):
+    from scout import search as search_core
+    from scout.search import ColumnTimeout, Match
+
+    fake_login(monkeypatch)
+    locate_fake(monkeypatch, outcomes=[_outcome("A", 5, True)], hits=[Match("O", "T", "A", "a1")])
+
+    def timing_out(pool, column, opts, cancel=None):
+        yield Match("O", "T", "A", "h1")
+        raise ColumnTimeout("timed out after 9 s")
+
+    monkeypatch.setattr(search_core, "drill_down", timing_out)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "x"
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.query_one("#found", DataTable).move_cursor(row=0)
+        await pilot.click("#show-all")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        status = str(app.query_one("#status").render())
+    assert "timed out" in status.lower() and "partial" in status.lower()
+
+
+def test_progress_text_before_any_table_is_known():
+    from scout.control import Progress
+    from scout.tui import _progress_text
+
+    assert "Looking for tables" in _progress_text(Progress(0, 0, 0.0, (), 0, 0, 0))

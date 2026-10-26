@@ -215,7 +215,7 @@ def test_time_limit_sets_call_timeout_and_resets_it_for_pool_reuse(monkeypatch):
     fake = FakeDb(TWO_TABLES[:1], {"C1": hit})
     fake.patch(monkeypatch)
     list(search(CFG, opts(time_limit=1.5)))
-    assert fake.timeouts == [1500]
+    assert len(fake.timeouts) == 1 and 1400 < fake.timeouts[0] <= 1500  # the time left, in ms
     assert fake.conns[-1].call_timeout == 0
 
 
@@ -307,3 +307,135 @@ def test_an_interrupt_we_did_not_cause_stops_the_whole_search(monkeypatch):
     assert got == [] and skipped == []
     assert token.cancelled
     assert len(started) < 30  # the remaining tables were never started
+
+
+# ---- review fixes: a real total time limit, honest cancelled/timed-out reporting, no cancel gaps
+
+def test_time_limit_is_a_deadline_for_the_whole_query_not_per_round_trip(monkeypatch):
+    """call_timeout covers one round trip; the search re-arms it with the time that is left."""
+    seen = []
+
+    def slow_fetches(cur, conn):
+        calls = [0]
+
+        def fetchmany():
+            calls[0] += 1
+            seen.append(conn.call_timeout)
+            time.sleep(0.3)
+            return [("R%d" % calls[0], "needle")] if calls[0] < 10 else []
+
+        cur.fetchmany = fetchmany
+        return []
+
+    FakeDb(TWO_TABLES[:1], {"C1": slow_fetches}).patch(monkeypatch)
+    outcomes = []
+    start = time.monotonic()
+    got = list(search(CFG, opts(time_limit=0.8), on_column=outcomes.append))
+    assert time.monotonic() - start < 1.6  # without a deadline: 10 fetches x 0.3 s = 3 s
+    assert outcomes[0].timed_out and 1 <= outcomes[0].examples == len(got) < 10
+    assert all(0 < ms <= 800 for ms in seen) and seen == sorted(seen, reverse=True)  # the budget shrinks
+
+
+def test_a_column_stopped_midway_is_not_reported_as_complete(monkeypatch):
+    stop_mid = threading.Event()
+
+    def stops(cur, conn):
+        def fetchmany():
+            stop_mid.set()  # the stop flag flips while the column is being read
+            return [("R1", "needle one")]
+
+        cur.fetchmany = fetchmany
+        return []
+
+    from scout.search import Column, _search_column
+
+    fake = FakeDb(TWO_TABLES[:1], {"C1": stops})
+    conn = fake._acquire()
+    gen = _search_column(conn, Column("S", "A", "C1", "VARCHAR2"), "p", "i", stop_mid)
+    list_ = []
+    try:
+        while True:
+            list_.append(next(gen))
+    except StopIteration as done:
+        outcome = done.value
+    assert outcome.more_available  # cut short: "searched, nothing more" would be a lie
+
+
+def test_stop_is_checked_right_before_the_statement_starts(monkeypatch):
+    from scout.search import Column, _search_column
+
+    fake = FakeDb(TWO_TABLES[:1], {"C1": lambda cur, conn: pytest.fail("statement must not run")})
+    conn = fake._acquire()
+    stop = threading.Event()
+    stop.set()
+    gen = _search_column(conn, Column("S", "A", "C1", "VARCHAR2"), "p", "i", stop)
+    try:
+        next(gen)
+    except StopIteration as done:
+        assert done.value.more_available
+    assert not fake.timeouts  # no column query reached the cursor
+
+
+def test_break_running_resends_the_interrupt_to_still_registered_connections():
+    token, conn = CancelToken(), MagicMock()
+    token.register(conn)
+    token.cancel()
+    token.break_running()  # the consumer does this every heartbeat while cancelled
+    assert conn.cancel.call_count == 2
+    token.unregister(conn)
+    token.break_running()
+    assert conn.cancel.call_count == 2
+
+
+def test_discovery_is_cancellable_and_progress_is_sent_before_it(monkeypatch):
+    fake = FakeDb(TWO_TABLES)
+    fake.patch(monkeypatch)
+    registered = []
+    real_register = CancelToken.register
+    monkeypatch.setattr(CancelToken, "register", lambda self, conn: (registered.append(conn), real_register(self, conn))[1])
+    seen: list[Progress] = []
+    list(search(CFG, opts(threads=1), on_progress=seen.append))
+    assert seen[0] == Progress(0, 0, 0.0, (), 0, 0, 0)  # "looking for tables", before the dictionary query
+    assert registered[0] is fake.conns[0]  # the first connection used is the dictionary query's
+
+
+def test_a_timeout_without_callbacks_is_raised_not_swallowed(monkeypatch):
+    def timeout(cur, conn):
+        raise TIMEOUT
+
+    FakeDb(TWO_TABLES[:1], {"C1": timeout}).patch(monkeypatch)
+    with pytest.raises(ColumnTimeout):
+        list(search(CFG, opts(time_limit=1)))
+
+
+def test_a_timed_out_drill_down_says_so_after_the_hits(monkeypatch):
+    from scout.search import Column, drill_down
+
+    def partial(cur, conn):
+        calls = [0]
+
+        def fetchmany():
+            calls[0] += 1
+            if calls[0] == 1:
+                return [("R1", "needle one")]
+            raise TIMEOUT
+
+        cur.fetchmany = fetchmany
+        return []
+
+    fake = FakeDb(TWO_TABLES[:1], {"C1": partial})
+    got = []
+    with pytest.raises(ColumnTimeout):
+        for m in drill_down(fake.pool, Column("S", "A", "C1", "VARCHAR2"), opts(time_limit=1)):
+            got.append(m)
+    assert len(got) == 1  # what was found is delivered first
+
+
+def test_a_finished_drill_down_does_not_cancel_its_idle_connection():
+    from scout.search import Column, drill_down
+
+    fake = FakeDb(TWO_TABLES[:1], {"C1": hit})
+    got = list(drill_down(fake.pool, Column("S", "A", "C1", "VARCHAR2"), opts()))
+    assert len(got) == 1
+    for conn in fake.conns:
+        conn.cancel.assert_not_called()

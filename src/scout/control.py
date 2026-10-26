@@ -37,6 +37,15 @@ class CancelToken:
         for child in children:
             child.cancel()
 
+    def break_running(self) -> None:
+        """Re-send the interrupt to every connection still registered. A statement can start
+        just after cancel() (the window between registering and executing), so the search
+        repeats this on each heartbeat while it is cancelled and still draining."""
+        with self._lock:
+            conns = list(self._conns)
+        for conn in conns:
+            _break(conn)
+
     def register(self, conn) -> None:
         with self._lock:
             self._conns.append(conn)

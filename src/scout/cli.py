@@ -21,7 +21,16 @@ from scout.config import (
 from scout.control import CancelToken, Progress
 from scout.export import write_csv
 from scout.pattern import build_regex
-from scout.search import Column, ColumnOutcome, ColumnTimeout, DictionaryTier, Match, SearchOptions, drill_down, resolve_column
+from scout.search import (
+    Column,
+    ColumnOutcome,
+    ColumnTimeout,
+    DictionaryTier,
+    Match,
+    SearchOptions,
+    drill_down,
+    resolve_column,
+)
 from scout.search import search as run_search
 
 app = typer.Typer(help="SCOUT: search Oracle databases of unknown schema for strings.")
@@ -301,12 +310,14 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
         col = resolve_column(conn, ref, opts)
     if col is None:
         return False
-    token, found = CancelToken(), []
+    token, found, timed_out = CancelToken(), [], None
     gen = drill_down(session.pool, col, opts, token)
     try:
         for m in gen:
             found.append(m)
             typer.echo(f"{m.owner}.{m.table}.{m.column}\t{' '.join(m.value.split())}")
+    except ColumnTimeout as exc:
+        timed_out = exc  # what was found is kept, but the list is not every hit
     except KeyboardInterrupt:
         token.cancel()
         gen.close()
@@ -315,10 +326,16 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
     except oracledb.Error as exc:
         typer.secho(f"Database error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc
+    if token.cancelled:  # the interrupt reached the database but Python never saw the signal
+        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(130)
     if csv_path:
         with csv_path.open("w", newline="") as fp:
-            write_csv(found, fp)
+            write_csv(found, fp, {_key(col)} if timed_out else None)
     typer.echo(f"{len(found)} hit(s) in {_ref(col)}" + (f"; wrote {csv_path}" if csv_path else ""), err=True)
+    if timed_out:
+        typer.secho(f"Timed out ({timed_out}): the {len(found)} hit(s) above are partial, not every hit in "
+                    f"{_ref(col)}. Run again with a longer --time-limit or none.", fg=typer.colors.YELLOW, err=True)
     return True
 
 
