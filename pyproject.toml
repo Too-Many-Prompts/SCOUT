@@ -30,6 +30,8 @@ packages = ["src/scout"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-m 'not bench'"  # slow benchmark-sized tests run only with: pytest -m bench
 markers = [
     "integration: requires a live Oracle database (see tests/conftest.py)",
+    "bench: slow, needs the generated SCOUT_BENCH dataset (python -m tests.bench.load)",
 ]

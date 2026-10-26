@@ -64,3 +64,11 @@ def admin_connection(admin_config):
     conn = _connect_or_skip(admin_config)
     yield conn
     conn.close()
+
+
+@pytest.fixture(scope="session")
+def admin_writer_connection(admin_config):
+    """Admin session that may write. Only for loaders that build test data (benchmark)."""
+    conn = _connect_or_skip(admin_config, read_only=False)
+    yield conn
+    conn.close()
