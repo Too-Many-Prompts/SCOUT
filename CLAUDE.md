@@ -9,12 +9,13 @@ with unknown schema for strings. Ships both a CLI and a Textual TUI against the 
 search logic.
 
 Implemented: column discovery, pattern building, threaded search, CSV export, the CLI `search`
-command and the TUI search/export (styled, themed front ends), locate mode with drill-down, cancel, time limits and live progress
+command and the TUI search/export (styled, themed front ends), locate mode with drill-down, cancel, time limits and live progress,
+snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-snippets-design.md`, plan beside the others)
 (design: `docs/superpowers/specs/2026-10-25-locate-first-search-design.md`, plan beside it, benchmark
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 644 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 7 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 3.5 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 699 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -43,6 +44,18 @@ Status: 644 tests pass with the database up (integration tests run once per scan
   contract tests see complete results. Every searched column reports one `ColumnOutcome`
   (`on_column`); `drill_down` / `resolve_column` / `--column REF` / shell `more REF` / TUI "Show all
   hits" fetch every hit for one column. Locate-mode CSV gains a `complete` column (`no` = examples only).
+- **Snippets (the CLI, shell and TUI always ask for them):** `SearchOptions.snippet_context` (`SNIPPET_CONTEXT` = 20
+  characters each side; library default `None` = whole values, so `tests/db/expected.py` is unchanged). Oracle cuts
+  the first match (`_snippet_sql`) and returns `before`/`hit`/`after` as strings in `Match.snippet`, never positions
+  for Python to slice: Oracle counts CLOB positions in UTF-16 units (an emoji is 2). `Snippet.position` is Oracle's
+  own number, used only to hand back to Oracle. The match position is computed once per row in an inline view
+  carrying `ROWNUM`; without it Oracle evaluates the regex again wherever the position is used (111 s against
+  37-48 s on a 97 MB CLOB). The substring pre-check stays in front of the regex. Whole-word hits exclude the
+  boundary characters (`pattern.snippet_regex` captures the text as subexpression 2; `back` = 1), and the
+  more-in-value check searches from the end of the hit, so `albert albert` counts as two. `…` marks a cut side
+  (`display.parts`), added by the front ends only. `fetch_detail` (TUI Enter) cuts `DETAIL_CONTEXT` = 100,000
+  characters each side by rowid, starting the regex at `Snippet.position` and skipping the pre-check (on one row
+  it would lowercase the whole value: 3.6 s against 0.0 s); it returns None when the row changed.
 - **Time limit:** locate-mode queries get 300 s (`DEFAULT_TIME_LIMIT`; `--time-limit`). It is a deadline for
   the whole query: the driver's `call_timeout` covers only one round trip, so `_search_column` re-arms it
   with the time left before every fetch. A column that runs out is `ColumnOutcome.timed_out`; with no hits
@@ -211,16 +224,21 @@ These shape how the modules below are built — read this before changing code.
 - **Schema scope is chosen at login.** Host, port, service name, user, password and the schema(s) to
   search (comma-separated, blank = every visible schema) are all asked before connecting; every
   table in the named schema is searched. In the shell `search --schema` overrides it per search.
-- **Front-end conventions.**
-  - *CLI:* stdout is exactly `OWNER.TABLE.COLUMN<TAB>value`; tests and scripts read it. All styling goes through
+- **Front-end conventions.** CSV with snippets writes the snippet (`…`, whitespace kept) and a `more_in_value`
+  yes/no column after `value`; without snippets the file is the old format.
+  - *CLI:* stdout is exactly `OWNER.TABLE.COLUMN<TAB>snippet` (with `…` markers, whitespace folded, and a dim
+    ` (+more)` suffix when the value has more matches); tests and scripts read it. All styling goes through
     `typer.style`/`secho` (click strips it when not a tty) or to stderr, so never decorate a stdout line. Error
     text is pinned by tests (`Database error`, `Unknown command`, `No searchable column`, `Error:`); `_error()`
     prints the message as given.
   - *TUI:* custom `scout` theme (`SCOUT_THEME`, `SCOUT_CSS` in `tui.py`); amber is reserved for "a hit". Tests
     use the ids `#status #found #results #skipped #terms #search #cancel #show-all #export`; keep them. Do not
     name an App method `_running` (Textual has an attribute of that name; ours is `_set_running`). Enter in
-    terms/near/threads runs the search, Ctrl+E exports, Cancel is enabled only while something runs, and hits are
-    marked by `_highlight_pattern` (cosmetic: Oracle decides what matched). "Show all hits" stays enabled on
+    terms/near/threads runs the search, Ctrl+E exports, Cancel is enabled only while something runs. Snippet hits
+    mark exactly what Oracle matched, with a dim ` +` badge for more matches; only whole-value matches fall back to
+    `_highlight_pattern` (cosmetic). Enter on a `#results` cell opens `DetailScreen` (a read-only `TextArea`, ids
+    `#detail-title #detail-note #detail-text`, hit selected in amber, Esc closes), loaded by a `group="detail"`
+    worker that never cancels a running search. "Show all hits" stays enabled on
     purpose (a test expects the "Select a column" message).
 - **A broken column never sinks the crawl.** `search(..., on_skip=cb)` reports columns that fail
   (e.g. an external table whose file is missing) via `cb`, from the caller's thread, and carries

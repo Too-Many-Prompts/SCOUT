@@ -13,7 +13,7 @@ from dataclasses import replace
 from dotenv import load_dotenv
 
 from scout.config import ConnectionConfig
-from scout.search import SearchOptions, search
+from scout.search import SNIPPET_CONTEXT, SearchOptions, search
 from tests.bench import clobs
 from tests.bench.load import ABSENT, NEEDLE, SCHEMA
 
@@ -30,8 +30,9 @@ def measure(cfg: ConnectionConfig, variants: dict[str, SearchOptions]) -> list[t
     return out
 
 
-def default_variants(threads: int, limit: int | None, schema: str = SCHEMA) -> dict[str, SearchOptions]:
-    base = SearchOptions(terms=(ABSENT,), schemas=(schema,), threads=threads)
+def default_variants(threads: int, limit: int | None, schema: str = SCHEMA,
+                     snippet_context: int | None = None) -> dict[str, SearchOptions]:
+    base = SearchOptions(terms=(ABSENT,), schemas=(schema,), threads=threads, snippet_context=snippet_context)
     variants = {
         "absent": base,
         "needle": replace(base, terms=(NEEDLES[schema],)),
@@ -53,6 +54,8 @@ def main() -> None:
     ap.add_argument("--single-scan", choices=("on", "off"), default=None,
                     help="force one scan per table on or off (default: the library setting)")
     ap.add_argument("--schema", choices=sorted(NEEDLES), default=SCHEMA, help="dataset to search")
+    ap.add_argument("--snippets", choices=("on", "off"), default="off",
+                    help="cut snippets (SNIPPET_CONTEXT characters each side) instead of whole values")
     args = ap.parse_args()
     if args.single_scan:
         import scout.search
@@ -70,7 +73,8 @@ def main() -> None:
         password=os.environ["SCOUT_TEST_READER_PASSWORD"],
     )
     print(f"{'variant':<24}{'seconds':>10}{'matches':>10}")
-    for name, secs, n in measure(cfg, default_variants(args.threads, args.limit, args.schema)):
+    context = SNIPPET_CONTEXT if args.snippets == "on" else None
+    for name, secs, n in measure(cfg, default_variants(args.threads, args.limit, args.schema, context)):
         print(f"{name:<24}{secs:>10.2f}{n:>10}")
 
 

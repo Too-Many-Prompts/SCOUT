@@ -2,7 +2,7 @@
 exactly one row of its table, and a locate-mode search over all of it finishes in time."""
 import pytest
 
-from scout.search import SearchOptions, search
+from scout.search import SNIPPET_CONTEXT, SearchOptions, search
 from tests.bench.clobs import ABSENT, FOURK, KANA, SCHEMA, TAIL, THIRTYTWOK
 
 pytestmark = [pytest.mark.integration, pytest.mark.bench]
@@ -44,3 +44,11 @@ def test_locate_mode_on_a_common_word(tables, reader_config):
     bodies = {o.column.table: o for o in outcomes if o.column.column == "BODY"}
     assert bodies and not any(o.timed_out for o in bodies.values())
     assert bodies["WIKI_SIMPLE"].examples == 5 and bodies["BOOKS"].examples == 5
+
+
+def test_tail_snippet_on_the_huge_value(tables, reader_config):
+    opts = SearchOptions(terms=(TAIL,), schemas=(SCHEMA,), tables=("BOOKS",), threads=8,
+                         snippet_context=SNIPPET_CONTEXT)
+    (m,) = list(search(reader_config, opts))
+    assert m.snippet.hit == TAIL and m.snippet.after == "" and m.snippet.cut_before
+    assert len(m.value) <= 2 * SNIPPET_CONTEXT + len(TAIL)
