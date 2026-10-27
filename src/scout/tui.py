@@ -31,7 +31,7 @@ from scout.display import CUT, parts
 from scout.export import write_csv
 from scout.pattern import build_regex
 from scout.search import (
-    SNIPPET_CONTEXT, Column, ColumnOutcome, ColumnTimeout, Detail, Match, SearchOptions,
+    SNIPPET_CONTEXT, Column, ColumnOutcome, ColumnTimeout, Detail, Match, RowField, SearchOptions,
 )
 
 
@@ -104,9 +104,48 @@ DetailScreen { align: center middle; }
 #detail-note { padding: 0 1; color: $text-muted; }
 #detail-text { height: 1fr; }
 #detail-text .text-area--selection { background: $accent; color: $background; }
+
+RowScreen { align: center middle; }
+#row { width: 90%; height: 90%; border: round $primary; border-title-color: $primary; background: $surface; }
+#row-title { padding: 0 1; text-style: bold; }
+#row-note { padding: 0 1; color: $text-muted; }
+#row-fields { height: 1fr; background: $surface; }
+#whole-row { width: 100%; }
 """
 
 VANISHED = "This row no longer matches (it changed after the search)."
+ROW_GONE = "This row no longer exists (it changed after the search)."
+HIT_MARK = "▶"
+
+
+def format_size(n: int) -> str:
+    """Bytes as '812 bytes', '12 KB' or '3.4 MB'."""
+    if n < 1024:
+        return f"{n:,} bytes"
+    for unit in ("KB", "MB", "GB"):
+        n /= 1024
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if n >= 10 else f"{n:.1f} {unit}"
+    raise AssertionError("unreachable")
+
+
+def row_cell(f: RowField, hit: str | None = None) -> Text:
+    """One value of the whole-row sheet. NULL and not-fetched content are dim, a cut value says how
+    long it really is, and `hit` (the text Oracle matched, for the searched column) is amber."""
+    if not f.shown:
+        what = f"{f.dtype}, {format_size(f.length)}" if f.length is not None else f.dtype
+        return Text(f"‹{what}›", style="dim")
+    if f.value is None:
+        return Text("NULL", style="dim italic")
+    text = Text(" ".join(f.value.split()), overflow="fold")
+    if hit:
+        at = text.plain.find(" ".join(hit.split()))
+        if at >= 0:
+            text.stylize(HIT_STYLE, at, at + len(" ".join(hit.split())))
+    if f.cut:
+        text.append(CUT)
+        text.append(f" ({len(f.value):,} of {f.length:,} characters)" if f.length else "", style="dim")
+    return text
 
 
 def detail_text(d: Detail) -> tuple[str, tuple[int, int], tuple[int, int]]:
@@ -146,11 +185,12 @@ class DetailScreen(ModalScreen[None]):
     """A large window around one hit (DETAIL_CONTEXT characters each side), read-only and
     scrolled to the hit, which is selected (amber). Esc closes it."""
 
-    BINDINGS = [Binding("escape", "dismiss", "Close")]
+    BINDINGS = [Binding("escape", "dismiss", "Close"), Binding("r", "whole_row", "Whole row")]
 
-    def __init__(self, ref: str) -> None:
+    def __init__(self, match: Match) -> None:
         super().__init__()
-        self.ref = ref
+        self.match = match
+        self.ref = match.ref
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail"):
@@ -159,7 +199,11 @@ class DetailScreen(ModalScreen[None]):
             yield TextArea(id="detail-text", read_only=True, soft_wrap=True)
 
     def on_mount(self) -> None:
-        self.query_one("#detail").border_title = "Hit in context (Esc to close)"
+        self.query_one("#detail").border_title = "Hit in context (Esc to close, r for the whole row)"
+
+    def action_whole_row(self) -> None:
+        self.dismiss()
+        self.app.show_row(self.match)
 
     def show_detail(self, d: Detail | None) -> None:
         if not self.is_attached:  # closed while loading
@@ -179,6 +223,60 @@ class DetailScreen(ModalScreen[None]):
     def show_error(self, message: str) -> None:
         if self.is_attached:
             self.query_one("#detail-note", Label).update(message)
+
+
+class RowScreen(ModalScreen[None]):
+    """Every column of the row behind a hit, one column per line: names down the left, values on the
+    right, the searched column marked and its hit amber. Enter on that column opens the hit in
+    context; Esc closes."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+
+    def __init__(self, match: Match) -> None:
+        super().__init__()
+        self.match = match
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="row"):
+            yield Label(Text.assemble(f"{self.match.owner}.{self.match.table}  ", (str(self.match.rowid), "dim")),
+                        id="row-title")
+            yield Label("Loading...", id="row-note")
+            yield DataTable(id="row-fields", cursor_type="row", zebra_stripes=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#row").border_title = "Whole row (Esc to close)"
+
+    def show_row(self, fields: list[RowField] | None) -> None:
+        if not self.is_attached:  # closed while loading
+            return
+        note = self.query_one("#row-note", Label)
+        if fields is None:
+            note.update(ROW_GONE)
+            return
+        table = self.query_one("#row-fields", DataTable)
+        width = max(20, table.size.width - 2 - max(len(f.name) for f in fields) - 20 - 8)
+        table.add_column("", width=1)
+        table.add_column("Column")
+        table.add_column("Type")
+        table.add_column("Value", width=width)
+        hit = self.match.snippet.hit if self.match.snippet is not None else None
+        for f in fields:
+            is_hit = f.name == self.match.column
+            table.add_row(
+                Text(HIT_MARK, style=HIT_STYLE) if is_hit else "",
+                Text(f.name, style=HIT_STYLE if is_hit else "bold"),
+                Text(f.dtype.lower(), style="dim"),
+                row_cell(f, hit if is_hit else None),
+                key=f.name, height=None,
+            )
+            if is_hit:
+                table.move_cursor(row=table.row_count - 1, scroll=True)
+        note.update(f"{len(fields)} columns")
+        table.focus()
+
+    def show_error(self, message: str) -> None:
+        if self.is_attached:
+            self.query_one("#row-note", Label).update(message)
 
 
 class LoginScreen(Screen):
@@ -272,6 +370,7 @@ class ScoutApp(App):
         Binding("ctrl+l", "logout", "Log out"),
         Binding("escape", "cancel_search", "Cancel search"),
         Binding("ctrl+e", "export", "Export CSV"),
+        Binding("r", "whole_row", "Whole row"),
     ]
     CSS = SCOUT_CSS
 
@@ -317,6 +416,7 @@ class ScoutApp(App):
                 pane.border_title = "Hits"
                 yield Label("No search yet. Type a term and press Enter.", id="empty")
                 yield DataTable(id="results")
+                yield Button("Whole row", id="whole-row")
         yield DataTable(id="skipped")
         yield Footer()
 
@@ -369,6 +469,8 @@ class ScoutApp(App):
             self.action_cancel_search()
         elif event.button.id == "show-all":
             self.show_all_hits()
+        elif event.button.id == "whole-row":
+            self.action_whole_row()
 
     def _value(self, wid: str) -> str:
         return str(self.query_one(f"#{wid}").value).strip()
@@ -614,15 +716,53 @@ class ScoutApp(App):
         )
 
     def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
-        """Enter on a hit opens the detail window (a large window around the hit)."""
-        if event.data_table.id != "results" or self.session is None or self.opts is None:
+        """Enter on a hit opens the detail window (a large window around the hit); Enter on the
+        searched column of the whole-row sheet opens the same window."""
+        if self.session is None or self.opts is None:
             return
-        m = self.matches[int(event.cell_key.row_key.value)]
-        if m.rowid is None:
+        if event.data_table.id == "results":
+            self._open_detail(self.matches[int(event.cell_key.row_key.value)])
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on the searched column of the whole-row sheet opens the hit in context."""
+        if event.data_table.id == "row-fields" and isinstance(self.screen, RowScreen):
+            if event.row_key.value == self.screen.match.column:
+                self._open_detail(self.screen.match)
+
+    def _open_detail(self, m: Match) -> None:
+        if m.rowid is None or self.session is None or self.opts is None:
             return
-        screen = DetailScreen(m.ref)
+        screen = DetailScreen(m)
         self.push_screen(screen)
         self._detail_worker(self.session, m, self.opts, screen)
+
+    def action_whole_row(self) -> None:
+        """r / the Whole row button: every column of the row behind the selected hit."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        table = self.query_one("#results", DataTable)
+        if not self.matches or table.row_count == 0:
+            self._status("Select a hit first.", "warn")
+            return
+        row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        self.show_row(self.matches[int(row_key.value)])
+
+    def show_row(self, m: Match) -> None:
+        if m.rowid is None or self.session is None:
+            return
+        screen = RowScreen(m)
+        self.push_screen(screen)
+        self._row_worker(self.session, m, screen)
+
+    @work(thread=True, exclusive=True, group="detail")
+    def _row_worker(self, session: db.Session, m: Match, screen: RowScreen) -> None:
+        try:
+            with db.acquire(session.pool) as conn:
+                fields = search_core.fetch_row(conn, m)
+        except Exception as exc:
+            self.call_from_thread(screen.show_error, f"Error: {str(exc).splitlines()[0]}")
+            return
+        self.call_from_thread(screen.show_row, fields)
 
     @work(thread=True, exclusive=True, group="detail")
     def _detail_worker(self, session: db.Session, m: Match, opts: SearchOptions, screen: DetailScreen) -> None:

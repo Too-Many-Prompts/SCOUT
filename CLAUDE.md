@@ -12,10 +12,10 @@ Implemented: column discovery, pattern building, threaded search, CSV export, th
 command and the TUI search/export (styled, themed front ends), locate mode with drill-down, cancel, time limits and live progress,
 snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-snippets-design.md`, plan beside the others)
 (design: `docs/superpowers/specs/2026-10-25-locate-first-search-design.md`, plan beside it, benchmark
-results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
-behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
+results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`), and the TUI whole-row sheet (`search.fetch_row`
+by rowid; TUI only, see "Front-end conventions"). Not implemented yet: any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 711 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 723 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -239,7 +239,13 @@ These shape how the modules below are built — read this before changing code.
     `_highlight_pattern` (cosmetic). Enter on a `#results` cell opens `DetailScreen` (a read-only `TextArea`, ids
     `#detail-title #detail-note #detail-text`, hit selected in amber, Esc closes), loaded by a `group="detail"`
     worker that never cancels a running search. "Show all hits" stays enabled on
-    purpose (a test expects the "Select a column" message).
+    purpose (a test expects the "Select a column" message). `r` / the `#whole-row` button (also `r` inside
+    `DetailScreen`) opens `RowScreen`: the whole row behind the selected hit by rowid (`fetch_row`, one
+    `SELECT` of every dictionary column with `WHERE ROWID = CHARTOROWID(:rid)`), one column per line (ids
+    `#row-title #row-note #row-fields`), the searched column marked `▶` with the cursor on it and its hit
+    amber; Enter on that column opens the `DetailScreen`. Values are cut to `ROW_CELL_CHARS` (1,000) by Oracle
+    (`DBMS_LOB.SUBSTR` + `GETLENGTH`) with the real length shown; BLOB/RAW show only their size and LONG,
+    XMLTYPE, BFILE and object types only their type (`RowField.shown`). `r` does nothing while a modal is open.
 - **A broken column never sinks the crawl.** `search(..., on_skip=cb)` reports columns that fail
   (e.g. an external table whose file is missing) via `cb`, from the caller's thread, and carries
   on; the CLI and TUI list them at the end. Without `on_skip`, the error is raised. The seed's

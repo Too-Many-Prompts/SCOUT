@@ -201,13 +201,12 @@ def test_dba_tier_zebra_search_finds_only_real_tables(admin_config):
     assert {k[1] for k in got} == {"INDEXED_NOTES", "PLAIN_NOTES"}
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="future feature: fetch the whole row")
 def test_fetch_row_returns_the_whole_row(reader_config, reader_connection):
     from scout.search import fetch_row
 
     match = next(iter(search(reader_config, SearchOptions(terms=("albertina",), schemas=("SCOUT_HR",)))))
-    row = fetch_row(reader_connection, match)
-    assert row["ID"] == 10 and row["FIRST_NAME"] == "Jon" and row["NOTES"] == "Albertina"
+    row = {f.name: f for f in fetch_row(reader_connection, match)}
+    assert row["ID"].value == "10" and row["FIRST_NAME"].value == "Jon" and row["NOTES"].value == "Albertina"
 
 
 def test_broken_table_is_skipped_with_on_skip_and_search_continues(reader_config):

@@ -141,6 +141,7 @@ PRECHECK = True  # cheap substring test before the regex; kept only if the bench
 SEARCHABLE_TYPES = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB")
 SNIPPET_CONTEXT = 20  # characters each side of the hit in the CLI, the TUI table and the CSV
 DETAIL_CONTEXT = 100_000  # characters each side of the hit in the TUI's detail window
+ROW_CELL_CHARS = 1_000  # characters of one value in the TUI's whole-row view (Oracle's SUBSTR returns at most 4,000 bytes)
 
 
 @dataclass(frozen=True)
@@ -882,6 +883,78 @@ def fetch_detail(
     return None if found is None else Detail(found.snippet, int(total or 0))
 
 
-def fetch_row(conn: oracledb.Connection, match: Match) -> dict[str, object]:
-    """Future feature: the entire row behind a match."""
-    raise NotImplementedError
+@dataclass(frozen=True)
+class RowField:
+    """One column of a fetched row, ready to show."""
+
+    name: str
+    dtype: str  # the dictionary's DATA_TYPE
+    value: str | None  # text to show; None = NULL, or content not fetched (see `shown`)
+    length: int | None = None  # whole length: characters for text, bytes for BLOB/RAW
+    cut: bool = False  # `value` is only the first ROW_CELL_CHARS characters
+    shown: bool = True  # False: BLOB/RAW/other types whose content is never fetched
+
+
+_ROW_TEXT = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2")
+_ROW_LOBS = ("CLOB", "NCLOB")
+_ROW_PLAIN = ("NUMBER", "FLOAT", "BINARY_", "DATE", "TIMESTAMP", "INTERVAL", "ROWID", "UROWID")
+
+
+def fetch_row(conn: oracledb.Connection, match: Match, cell_chars: int = ROW_CELL_CHARS) -> list[RowField] | None:
+    """The whole row behind a match, by rowid: every column in table order, values as text.
+
+    Long text (CLOBs) is cut by Oracle to `cell_chars` characters with its full length alongside;
+    BLOB/RAW report only their size, and types we do not render (LONG, XMLTYPE, BFILE, objects)
+    only their type. None when the row is gone or the table is not visible. The owner/table/column
+    names come from the dictionary and are quoted; the rowid is a bind."""
+    if match.rowid is None:
+        raise ValueError("the match carries no rowid")
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT column_name, data_type FROM all_tab_columns
+                WHERE owner = :o AND table_name = :t ORDER BY column_id""",
+            o=match.owner, t=match.table)
+        columns = cur.fetchall()
+        if not columns:
+            return None
+        pieces: list[str] = []
+        for name, dtype in columns:
+            q = _quote(name)
+            if dtype in _ROW_LOBS:
+                pieces += [f"DBMS_LOB.SUBSTR({q}, :cell, 1)", f"DBMS_LOB.GETLENGTH({q})"]
+            elif dtype == "BLOB":
+                pieces.append(f"DBMS_LOB.GETLENGTH({q})")
+            elif dtype == "RAW":
+                pieces.append(f"UTL_RAW.LENGTH({q})")
+            elif dtype in _ROW_TEXT or dtype.startswith(_ROW_PLAIN):
+                pieces.append(q)
+        sql = (f"SELECT {', '.join(['1'] + pieces)} FROM {_quote(match.owner)}.{_quote(match.table)} "
+               "WHERE ROWID = CHARTOROWID(:rid)")
+        binds: dict[str, object] = {"rid": match.rowid}
+        if any(dtype in _ROW_LOBS for _, dtype in columns):
+            binds["cell"] = cell_chars
+        cur.execute(sql, **binds)
+        row = cur.fetchone()
+    if row is None:
+        return None
+    values = iter(row[1:])
+    fields = []
+    for name, dtype in columns:
+        if dtype in _ROW_LOBS:
+            text, length = next(values), next(values)
+            fields.append(RowField(name, dtype, text, None if length is None else int(length),
+                                   cut=length is not None and int(length) > len(text or "")))
+        elif dtype in ("BLOB", "RAW"):
+            length = next(values)
+            fields.append(RowField(name, dtype, None, None if length is None else int(length),
+                                   shown=length is None))
+        elif dtype in _ROW_TEXT or dtype.startswith(_ROW_PLAIN):
+            v = next(values)
+            if v is None:
+                fields.append(RowField(name, dtype, None))
+            else:
+                text = str(v)
+                fields.append(RowField(name, dtype, text[:cell_chars], len(text), cut=len(text) > cell_chars))
+        else:
+            fields.append(RowField(name, dtype, None, shown=False))
+    return fields
