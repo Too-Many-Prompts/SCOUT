@@ -1,7 +1,7 @@
 import os
 import shlex
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated
 
@@ -91,10 +91,7 @@ def shell(
 ) -> None:
     """Log in once, then run many searches at a scout> prompt."""
     cfg, schemas = _connection_config(host, port, service, schema, non_interactive, ask_endpoint=True)
-    try:
-        session = db.open_session(cfg, schemas, threads if threads is not None else default_threads())
-    except oracledb.Error as exc:
-        raise _db_failed(exc) from exc
+    session = _open_session(cfg, schemas, threads if threads is not None else default_threads())
     scope = ", ".join(schemas) if schemas else "every visible schema"
     typer.echo(
         typer.style("Connected", fg=typer.colors.GREEN, bold=True)
@@ -199,17 +196,41 @@ def search(
     ] = False,
 ) -> None:
     """Search all string columns for TERMS: a few examples per column first (use --all for every hit)."""
+    opts = _search_options(terms, whole_word, near, case_sensitive, all_hits, column_ref, time_limit, threads, table, dba)
+    session = ctx.obj if isinstance(ctx.obj, db.Session) else None  # set by the shell: already logged in
+    cfg, opts = _scope(session, opts, schema, host, port, service, non_interactive)
+    if column_ref is not None:
+        _search_one_column(session, cfg, opts, column_ref, csv_path)
+        return
+    run = _locate(cfg, opts, session.pool if session is not None else None)
+    _report(run, opts, csv_path, in_shell=session is not None)
+
+
+def _search_options(
+    terms: list[str],
+    whole_word: bool,
+    near: int | None,
+    case_sensitive: bool,
+    all_hits: bool,
+    column_ref: str | None,
+    time_limit: float | None,
+    threads: int | None,
+    table: list[str] | None,
+    dba: bool,
+) -> SearchOptions:
+    """The search's options from the command line (schemas are filled in later, by _scope).
+
+    Checked before anything is prompted for: bad terms or a bad --time-limit fail at once."""
     if time_limit is not None and time_limit <= 0:
         raise typer.BadParameter("must be more than 0 seconds", param_hint="--time-limit")
     locate = not all_hits and column_ref is None
     if time_limit is None and locate:
         time_limit = DEFAULT_TIME_LIMIT  # --all and --column run to the end unless asked
-    base = SearchOptions(
+    opts = SearchOptions(
         terms=tuple(terms),
         case_sensitive=case_sensitive,
         whole_word=whole_word,
         near=near,
-        schemas=(),
         tables=tuple(table or ()),
         tier=DictionaryTier.DBA if dba else DictionaryTier.ALL,
         threads=threads if threads is not None else default_threads(),
@@ -217,111 +238,165 @@ def search(
         time_limit=time_limit,
     )
     try:
-        build_regex(base)  # reject bad terms before prompting for anything
+        build_regex(opts)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    return opts
 
-    session = ctx.obj if isinstance(ctx.obj, db.Session) else None  # set by the shell: already logged in
-    if session is not None:
-        cfg, schemas, pool = session.cfg, tuple(schema or session.schemas), session.pool
-    else:
+
+def _scope(
+    session: db.Session | None,
+    opts: SearchOptions,
+    schema: list[str] | None,
+    host: str | None,
+    port: int | None,
+    service: str | None,
+    non_interactive: bool,
+) -> tuple[ConnectionConfig, SearchOptions]:
+    """Where to search: the shell's login (--schema may override its schemas), or a new login.
+
+    In the shell, the options are also kept as session.last_opts for `more`."""
+    if session is None:
         cfg, schemas = _connection_config(host, port, service, schema, non_interactive)
-        pool = None
-    opts = replace(base, schemas=schemas)
-    if session is not None:
-        session.last_opts = opts
+        return cfg, replace(opts, schemas=schemas)
+    opts = replace(opts, schemas=tuple(schema or session.schemas))
+    session.last_opts = opts
+    return session.cfg, opts
 
-    if column_ref is not None:
-        owned = None
-        if session is None:
-            try:
-                session = owned = db.open_session(cfg, schemas, opts.threads)
-            except oracledb.Error as exc:
-                raise _db_failed(exc) from exc
-        try:
-            if not _drill(session, opts, column_ref, csv_path):
-                raise typer.BadParameter(
-                    f"No searchable column {column_ref!r}; use OWNER.TABLE.COLUMN of a text column.",
-                    param_hint="--column",
-                )
-        finally:
-            if owned is not None:
-                owned.close()
-        return
 
-    found: list[Match] = []
-    outcomes: dict[tuple[str, str, str], ColumnOutcome] = {}
-    skipped: list[tuple[Column, Exception]] = []
-    timed_out: list[Column] = []
-    columns_searched = 0
+def _search_one_column(
+    session: db.Session | None, cfg: ConnectionConfig, opts: SearchOptions, ref: str, csv_path: Path | None
+) -> None:
+    """--column: every hit in one column, on the shell's login or on one opened just for this."""
+    owned = None
+    if session is None:
+        session = owned = _open_session(cfg, opts.schemas, opts.threads)
+    try:
+        exists = _drill(session, opts, ref, csv_path)
+    finally:
+        if owned is not None:
+            owned.close()
+    if not exists:
+        raise typer.BadParameter(
+            f"No searchable column {ref!r}; use OWNER.TABLE.COLUMN of a text column.", param_hint="--column"
+        )
+
+
+def _open_session(cfg: ConnectionConfig, schemas: tuple[str, ...], threads: int) -> db.Session:
+    try:
+        return db.open_session(cfg, schemas, threads)
+    except oracledb.Error as exc:
+        raise _db_failed(exc) from exc
+
+
+@dataclass
+class _LocateRun:
+    """What a search over every column found, for the summary printed after the hits."""
+
+    found: list[Match] = field(default_factory=list)
+    outcomes: dict[tuple[str, str, str], ColumnOutcome] = field(default_factory=dict)  # by Column.address
+    skipped: list[tuple[Column, Exception]] = field(default_factory=list)  # could not be searched
+    timed_out: list[Column] = field(default_factory=list)  # ran out of time with no hits
+    columns_searched: int = 0
+
+    def on_skip(self, col: Column, exc: Exception) -> None:
+        if isinstance(exc, ColumnTimeout):
+            self.timed_out.append(col)
+        else:
+            self.skipped.append((col, exc))
+
+    def on_column(self, outcome: ColumnOutcome) -> None:
+        self.outcomes[outcome.column.address] = outcome
+
+    @property
+    def incomplete(self) -> set[tuple[str, str, str]]:
+        """Columns whose hits shown are not all of them (more available, or timed out)."""
+        return {k for k, o in self.outcomes.items() if o.note}
+
+
+def _locate(cfg: ConnectionConfig, opts: SearchOptions, pool: oracledb.ConnectionPool | None) -> _LocateRun:
+    """Run the search, printing each hit to stdout as it arrives (and a progress line on a terminal)."""
+    run = _LocateRun()
     token = CancelToken()
     show_progress = sys.stderr.isatty()
 
-    def progress(p: Progress) -> None:
-        nonlocal columns_searched
-        columns_searched = p.columns_total
+    def on_progress(p: Progress) -> None:
+        run.columns_searched = p.columns_total
         if show_progress:
-            slow = f" · slowest {p.in_flight[0][0]} {p.in_flight[0][1]:.0f}s" if p.in_flight else ""
-            line = f"{_bar(p.fraction)} {p.fraction:4.0%}  {p.columns_done}/{p.columns_total} columns · {p.hits} hits{slow}"
-            typer.echo("\r" + typer.style(line, dim=True) + "\x1b[K", nl=False, err=True)
+            _print_progress(p)
 
-    def on_skip(col: Column, exc: Exception) -> None:
-        if isinstance(exc, ColumnTimeout):
-            timed_out.append(col)
-        else:
-            skipped.append((col, exc))
-
-    gen = run_search(cfg, opts, progress, on_skip, pool, on_column=lambda o: outcomes.__setitem__(o.column.address, o), cancel=token)
+    gen = run_search(cfg, opts, on_progress, run.on_skip, pool, on_column=run.on_column, cancel=token)
     try:
-        for m in gen:
-            found.append(m)
-            if show_progress:  # so the hit starts on its own line
+        try:
+            for m in gen:
+                run.found.append(m)
+                if show_progress:  # so the hit starts on its own line
+                    _wipe_line()
+                typer.echo(_hit_line(m))
+        finally:
+            if show_progress:  # before any message below, so it does not land on the progress line
                 _wipe_line()
-            typer.echo(_hit_line(m))
     except KeyboardInterrupt:
         token.cancel()
         gen.close()
-        if show_progress:
-            _wipe_line()
-        raise _cancelled(len(found)) from None
+        raise _cancelled(len(run.found)) from None
     except oracledb.Error as exc:
         raise _db_failed(exc) from exc
-    finally:
-        if show_progress:
-            _wipe_line()
-
     if token.cancelled:  # the interrupt reached the database but Python never saw the signal
-        raise _cancelled(len(found))
+        raise _cancelled(len(run.found))
+    return run
 
-    incomplete = {k for k, o in outcomes.items() if o.more_available or o.timed_out}
-    labelled = opts.limit_per_column is not None or bool(incomplete)
+
+def _print_progress(p: Progress) -> None:
+    """Redraw the one-line progress display on stderr."""
+    slow = f" · slowest {p.in_flight[0][0]} {p.in_flight[0][1]:.0f}s" if p.in_flight else ""
+    line = f"{_bar(p.fraction)} {p.fraction:4.0%}  {p.columns_done}/{p.columns_total} columns · {p.hits} hits{slow}"
+    typer.echo("\r" + typer.style(line, dim=True) + "\x1b[K", nl=False, err=True)
+
+
+def _report(run: _LocateRun, opts: SearchOptions, csv_path: Path | None, in_shell: bool) -> None:
+    """After the hits: the CSV file, a one-line summary, where it was found, and what was not searched."""
+    limited = opts.limit_per_column is not None
+    incomplete = run.incomplete
     if csv_path:
+        # locate-mode files (or any with a cut-short column) get the extra 'complete' column
+        labelled = limited or bool(incomplete)
         with csv_path.open("w", newline="") as fp:
-            write_csv(found, fp, incomplete if labelled else None)
-    summary = f"{len(found)} match(es) in {columns_searched} column(s)" + (f"; wrote {csv_path}" if csv_path else "")
-    typer.secho(summary, fg=typer.colors.GREEN if found else None, bold=bool(found), err=True)
-    if not found:
-        if whole_word:
-            typer.echo("Try again without --whole-word: it also finds the term inside longer words.", err=True)
-        elif case_sensitive:
-            typer.echo("Try again with --ignore-case.", err=True)
-        else:
-            typer.echo("Try fewer words, or a * wildcard.", err=True)
-    _print_where_found(outcomes, terms, in_shell=session is not None, limited=opts.limit_per_column is not None)
+            write_csv(run.found, fp, incomplete if labelled else None)
+    summary = f"{len(run.found)} match(es) in {run.columns_searched} column(s)"
+    if csv_path:
+        summary += f"; wrote {csv_path}"
+    typer.secho(summary, fg=typer.colors.GREEN if run.found else None, bold=bool(run.found), err=True)
+    if not run.found:
+        typer.echo(_no_match_hint(opts), err=True)
+    _print_where_found(run.outcomes, opts.terms, in_shell=in_shell, limited=limited)
     if csv_path and incomplete:
         typer.echo(
             f"Note: {csv_path} holds examples only for the columns marked complete=no; "
             "re-run with --all, or use --column for one column, to get every hit.",
             err=True,
         )
-    if timed_out:
+    _print_not_searched(run, opts)
+
+
+def _no_match_hint(opts: SearchOptions) -> str:
+    if opts.whole_word:
+        return "Try again without --whole-word: it also finds the term inside longer words."
+    if opts.case_sensitive:
+        return "Try again with --ignore-case."
+    return "Try fewer words, or a * wildcard."
+
+
+def _print_not_searched(run: _LocateRun, opts: SearchOptions) -> None:
+    """Columns that ran out of time with no hits, and columns that could not be searched at all."""
+    if run.timed_out:
         typer.secho(f"Timed out after {opts.time_limit:g} s (not searched to the end), so a column with "
                     "no hits listed here may still contain the term:", fg=typer.colors.YELLOW, err=True)
-        for col in sorted(timed_out, key=lambda c: c.address):
+        for col in sorted(run.timed_out, key=lambda c: c.address):
             typer.echo(f"  {col.ref}", err=True)
-    if skipped:
-        typer.secho(f"Skipped {len(skipped)} column(s) that could not be searched:", fg=typer.colors.YELLOW, err=True)
-        for col, exc in sorted(skipped, key=lambda s: s[0].address):
+    if run.skipped:
+        typer.secho(f"Skipped {len(run.skipped)} column(s) that could not be searched:", fg=typer.colors.YELLOW, err=True)
+        for col, exc in sorted(run.skipped, key=lambda s: s[0].address):
             typer.echo(f"  {col.ref}: {str(exc).splitlines()[0]}", err=True)
 
 
