@@ -83,8 +83,8 @@ Checkbox { border: none; height: 1; padding: 0 1; background: transparent; }
 #status.error { color: $error; }
 
 #body { height: 1fr; }
-#found-pane { width: 50%; height: 100%; border: round $panel; border-title-color: $primary; }
-#hits-pane { width: 1fr; height: 100%; border: round $panel; border-title-color: $primary; }
+#found-pane { width: 1fr; height: 100%; border: round $panel; border-title-color: $primary; }
+#hits-pane { width: 2fr; height: 100%; border: round $panel; border-title-color: $primary; }
 #found { height: 1fr; }
 #show-all { width: 100%; }
 #results { height: 1fr; }
