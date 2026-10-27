@@ -196,9 +196,14 @@ def search(
     ] = False,
 ) -> None:
     """Search all string columns for TERMS: a few examples per column first (use --all for every hit)."""
-    opts = _search_options(terms, whole_word, near, case_sensitive, all_hits, column_ref, time_limit, threads, table, dba)
+    opts = _search_options(
+        terms=terms, whole_word=whole_word, near=near, case_sensitive=case_sensitive, all_hits=all_hits,
+        column_ref=column_ref, time_limit=time_limit, threads=threads, table=table, dba=dba,
+    )
     session = ctx.obj if isinstance(ctx.obj, db.Session) else None  # set by the shell: already logged in
-    cfg, opts = _scope(session, opts, schema, host, port, service, non_interactive)
+    cfg, opts = _scope(
+        session, opts, schema=schema, host=host, port=port, service=service, non_interactive=non_interactive
+    )
     if column_ref is not None:
         _search_one_column(session, cfg, opts, column_ref, csv_path)
         return
@@ -207,6 +212,7 @@ def search(
 
 
 def _search_options(
+    *,
     terms: list[str],
     whole_word: bool,
     near: int | None,
@@ -247,6 +253,7 @@ def _search_options(
 def _scope(
     session: db.Session | None,
     opts: SearchOptions,
+    *,
     schema: list[str] | None,
     host: str | None,
     port: int | None,
