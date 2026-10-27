@@ -52,7 +52,7 @@ def main() -> None:
     if args.single_scan:
         import scout.search
 
-        scout.search.SINGLE_SCAN_PER_TABLE = args.single_scan == "on"
+        scout.search.SINGLE_SCAN_MIN_BLOCKS = 0 if args.single_scan == "on" else None
     if args.precheck:
         import scout.search
 

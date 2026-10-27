@@ -72,3 +72,15 @@ def admin_writer_connection(admin_config):
     conn = _connect_or_skip(admin_config, read_only=False)
     yield conn
     conn.close()
+
+
+@pytest.fixture(params=["per-column", "one-scan"])
+def scan_mode(request, monkeypatch):
+    """Run a searching test twice: every column on its own, then each table read once.
+
+    The seed tables are tiny, so by the size rule they would all be searched per column; this
+    forces the path so the whole contract in tests/db/expected.py is proved for both."""
+    from scout import search as search_mod
+
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_MIN_BLOCKS", 0 if request.param == "one-scan" else None)
+    return request.param

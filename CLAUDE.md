@@ -14,7 +14,7 @@ command and the TUI search/export (styled, themed front ends), locate mode with 
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 316 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
+Status: 616 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -67,9 +67,16 @@ Status: 316 tests pass, 1 strict-xfail (`fetch_row`), plus 1 `bench` test run se
   loosen them without extending those tests.
 - **Speed (benchmark, 20 tables x 50k rows, 140 columns, in cache):** the regex is the cost, not the scan.
   The pre-check is nested in `CASE WHEN INSTR(..) > 0 THEN CASE WHEN REGEXP_LIKE(..)` because Oracle does
-  not evaluate `AND` terms in order (measured): a no-hit search went from 59.5 s to 3.3 s. Single scan per
-  table (`SINGLE_SCAN_PER_TABLE`) is built and tested but OFF: no gain in cache, slower in locate mode;
-  revisit with a larger-than-memory dataset.
+  not evaluate `AND` terms in order (measured): a no-hit search went from 59.5 s to 3.3 s. A large table is read once
+  (`_plan_units`): a table with at least `SINGLE_SCAN_MIN_BLOCKS` blocks (12,800, about 100 MB; `None` = never),
+  or with no statistics, is searched by `_search_table` in groups of at most `MAX_COLUMNS_PER_SCAN` (20) columns;
+  smaller tables keep one scan per column, and proximity searches always do. Reason: with a cold cache one scan
+  halves a full-table search (13.3 s -> 6.4 s), but in locate mode it is up to 4x slower when every column has hits,
+  because it cannot stop until the slowest column has enough (numbers in the bench notes). The threshold is a
+  judgement, not a measured crossover. If a combined scan fails (not a cancel or timeout), its columns are retried
+  one by one without repeating hits already delivered, so a broken column is still skipped alone. A group shares
+  one deadline: `time_limit` applies per unit, so up to 20 columns share one 300 s where each had its own.
+  Tests force both paths with the `scan_mode` fixture (`tests/conftest.py`) on every searching integration module.
 - **READ ONLY snapshots:** a READ ONLY transaction cannot read an object whose definition changed within
   the same second (ORA-01466). Test loaders wait 2 s after DDL; on a live database that is being altered,
   an affected column simply shows up in the skipped list.

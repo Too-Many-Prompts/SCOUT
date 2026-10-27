@@ -11,6 +11,7 @@ GRANT CREATE TABLE, CTXAPP TO scout_docs;
 CREATE USER scout_odd    NO AUTHENTICATION QUOTA UNLIMITED ON users;
 CREATE USER scout_hidden NO AUTHENTICATION QUOTA UNLIMITED ON users;
 CREATE USER scout_broken NO AUTHENTICATION QUOTA UNLIMITED ON users;
+CREATE USER scout_virt   NO AUTHENTICATION QUOTA UNLIMITED ON users;
 
 -- Low-privilege searcher: sees hr/docs/odd via ALL_*, never scout_hidden.
 CREATE USER scout_reader IDENTIFIED BY "&1";
@@ -99,6 +100,75 @@ INSERT INTO scout_odd."ORDER" VALUES (2, 'nothing here', 'reservedneedle at a le
 CREATE TABLE scout_odd."TABLE" (id NUMBER, "COMMENT" VARCHAR2(100));
 INSERT INTO scout_odd."TABLE" VALUES (1, 'a reservedneedle comment');
 
+-- 60 string columns: more than one scan covers (MAX_COLUMNS_PER_SCAN = 20), so the groups are split
+-- at the boundaries. 'widehit' sits in columns 1, 20, 21, 40, 41 and 60.
+CREATE TABLE scout_odd.wide_60 (
+  id NUMBER,
+  c01 VARCHAR2(60),
+  c02 VARCHAR2(60),
+  c03 VARCHAR2(60),
+  c04 VARCHAR2(60),
+  c05 VARCHAR2(60),
+  c06 VARCHAR2(60),
+  c07 VARCHAR2(60),
+  c08 VARCHAR2(60),
+  c09 VARCHAR2(60),
+  c10 VARCHAR2(60),
+  c11 VARCHAR2(60),
+  c12 VARCHAR2(60),
+  c13 VARCHAR2(60),
+  c14 VARCHAR2(60),
+  c15 VARCHAR2(60),
+  c16 VARCHAR2(60),
+  c17 VARCHAR2(60),
+  c18 VARCHAR2(60),
+  c19 VARCHAR2(60),
+  c20 VARCHAR2(60),
+  c21 VARCHAR2(60),
+  c22 VARCHAR2(60),
+  c23 VARCHAR2(60),
+  c24 VARCHAR2(60),
+  c25 VARCHAR2(60),
+  c26 VARCHAR2(60),
+  c27 VARCHAR2(60),
+  c28 VARCHAR2(60),
+  c29 VARCHAR2(60),
+  c30 VARCHAR2(60),
+  c31 VARCHAR2(60),
+  c32 VARCHAR2(60),
+  c33 VARCHAR2(60),
+  c34 VARCHAR2(60),
+  c35 VARCHAR2(60),
+  c36 VARCHAR2(60),
+  c37 VARCHAR2(60),
+  c38 VARCHAR2(60),
+  c39 VARCHAR2(60),
+  c40 VARCHAR2(60),
+  c41 VARCHAR2(60),
+  c42 VARCHAR2(60),
+  c43 VARCHAR2(60),
+  c44 VARCHAR2(60),
+  c45 VARCHAR2(60),
+  c46 VARCHAR2(60),
+  c47 VARCHAR2(60),
+  c48 VARCHAR2(60),
+  c49 VARCHAR2(60),
+  c50 VARCHAR2(60),
+  c51 VARCHAR2(60),
+  c52 VARCHAR2(60),
+  c53 VARCHAR2(60),
+  c54 VARCHAR2(60),
+  c55 VARCHAR2(60),
+  c56 VARCHAR2(60),
+  c57 VARCHAR2(60),
+  c58 VARCHAR2(60),
+  c59 VARCHAR2(60),
+  c60 VARCHAR2(60)
+);
+INSERT INTO scout_odd.wide_60 (id, c01, c20, c21, c40, c41, c60)
+  VALUES (1, 'widehit one', 'widehit twenty', 'widehit twenty-one', 'widehit forty', 'widehit forty-one', 'widehit sixty');
+INSERT INTO scout_odd.wide_60 (id, c01, c21, c60) VALUES (2, 'second widehit', 'widehit again', 'last widehit');
+
 CREATE TABLE scout_odd.nums (n NUMBER, d DATE);
 INSERT INTO scout_odd.nums VALUES (42, DATE '2024-01-01');
 
@@ -115,6 +185,18 @@ CREATE TABLE scout_broken.ext_missing (txt VARCHAR2(100))
                          LOCATION ('missing.dat'))
   REJECT LIMIT UNLIMITED;
 
+-- (own schema, kept out of expected.SCHEMAS like SCOUT_BROKEN) One column that raises when the table is read (ORA-01476 on row 3) next to a healthy one: a scan of
+-- the whole table fails, but SCOUT must still search NOTE and skip only V.
+CREATE TABLE scout_virt.virt_err (
+  id   NUMBER,
+  note VARCHAR2(100),
+  v    VARCHAR2(40) GENERATED ALWAYS AS (TO_CHAR(10 / (id - 3))) VIRTUAL
+);
+INSERT INTO scout_virt.virt_err (id, note) VALUES (1, 'virtneedle first');
+INSERT INTO scout_virt.virt_err (id, note) VALUES (2, 'nothing here');
+INSERT INTO scout_virt.virt_err (id, note) VALUES (3, 'virtneedle third');
+INSERT INTO scout_virt.virt_err (id, note) VALUES (4, 'virtneedle fourth');
+
 COMMIT;
 
 -- reader gets everything except scout_hidden
@@ -128,6 +210,8 @@ GRANT SELECT ON scout_odd."MixedCase Table"  TO scout_reader;
 GRANT SELECT ON scout_odd."ORDER"            TO scout_reader;
 GRANT SELECT ON scout_odd."TABLE"            TO scout_reader;
 GRANT SELECT ON scout_odd.nums               TO scout_reader;
+GRANT SELECT ON scout_odd.wide_60            TO scout_reader;
 GRANT SELECT ON scout_odd.late_hit           TO scout_reader;
 GRANT SELECT ON scout_odd."Unicode Edge"   TO scout_reader;
 GRANT SELECT ON scout_broken.ext_missing     TO scout_reader;
+GRANT SELECT ON scout_virt.virt_err        TO scout_reader;

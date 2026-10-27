@@ -81,7 +81,12 @@ ProgressCallback = Callable[[Progress], None]
 SkipCallback = Callable[[Column, Exception], None]  # a column that could not be searched
 
 
-SINGLE_SCAN_PER_TABLE = False  # read each table once for all its string columns (see _search_table)
+# A table of at least this many blocks (about 100 MB at 8 KB) or of unknown size is read once for all its
+# string columns (_search_table): on a table too big to cache, separate column scans multiply the I/O.
+# Smaller tables keep one scan per column, which stops early in locate mode. None = never use one scan.
+# The value is a judgement, not a measured crossover (see the bench notes).
+SINGLE_SCAN_MIN_BLOCKS: int | None = 12800
+MAX_COLUMNS_PER_SCAN = 20  # one scan covers at most this many columns: short SQL, and a wide table uses several threads
 HEARTBEAT_SECONDS = 1.0  # progress is re-sent at least this often while a search is running
 TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})  # thick driver: call_timeout exceeded
 CANCEL_CODES = frozenset({"ORA-01013"})  # statement interrupted (our cancel(), or the user's Ctrl+C)
@@ -327,6 +332,24 @@ def _search_table(
     return [ColumnOutcome(c, counts[i], more[i], timed_out) for i, c in enumerate(cols)]
 
 
+def _plan_units(tables: dict[tuple[str, str], list[Column]], opts: SearchOptions) -> list[list[Column]]:
+    """Units of work: a list of columns that one statement searches.
+
+    Proximity searches and small tables get a unit per column. A large table (or one with no
+    statistics) is read once per group of at most MAX_COLUMNS_PER_SCAN columns, split evenly."""
+    units: list[list[Column]] = []
+    for cols in tables.values():
+        blocks = cols[0].blocks
+        if (opts.near is not None or SINGLE_SCAN_MIN_BLOCKS is None or len(cols) == 1
+                or (blocks is not None and blocks < SINGLE_SCAN_MIN_BLOCKS)):
+            units += [[c] for c in cols]
+        else:
+            groups = -(-len(cols) // MAX_COLUMNS_PER_SCAN)
+            size = -(-len(cols) // groups)
+            units += [cols[i:i + size] for i in range(0, len(cols), size)]
+    return units
+
+
 def resolve_column(conn: oracledb.Connection, ref: str, opts: SearchOptions) -> Column | None:
     """Find the searchable column named `OWNER.TABLE.COLUMN` (or None).
 
@@ -390,6 +413,39 @@ def drill_down(
     finally:
         if cancel is not None:
             cancel.unlink(token)
+
+
+def _column_of(unit: list[Column], m: Match) -> Column:
+    return next(c for c in unit if c.column == m.column)
+
+
+def _retry_column(conn, col: Column, args: tuple, seen: set, results: "queue.Queue", on_skip) -> None:
+    """Search one column on its own after a combined scan failed, without repeating hits already
+    delivered. With a limit, the column still ends with at most `limit` examples in total."""
+    limit = args[3]
+    delivered, capped = len(seen), False
+
+    def deliver(m: Match) -> None:
+        nonlocal delivered, capped
+        if m.rowid in seen:
+            return
+        if limit is not None and delivered >= limit:
+            capped = True
+            return
+        seen.add(m.rowid)
+        delivered += 1
+        results.put(m)
+
+    try:
+        outcome = _drain(_search_column(conn, col, *args), deliver)
+    except oracledb.DatabaseError as exc:
+        if _error_code(exc) in CANCEL_CODES:
+            raise
+        if on_skip is None:
+            raise
+        results.put(_Skipped(col, exc))
+        return
+    results.put(replace(outcome, examples=delivered, more_available=outcome.more_available or capped))
 
 
 def _drain(gen: Generator[Match, None, object], sink: Callable[[Match], None]):
@@ -504,8 +560,22 @@ def search(
                         if len(unit) == 1:
                             results.put(_drain(_search_column(conn, unit[0], *args), results.put))
                         else:
-                            for outcome in _drain(_search_table(conn, unit, *args), results.put):
-                                results.put(outcome)
+                            try:
+                                seen: dict[Column, set] = {}  # rowids already delivered, per column
+
+                                def deliver(m: Match, seen=seen) -> None:
+                                    seen.setdefault(_column_of(unit, m), set()).add(m.rowid)
+                                    results.put(m)
+
+                                for outcome in _drain(_search_table(conn, unit, *args), deliver):
+                                    results.put(outcome)
+                            except oracledb.DatabaseError as exc:
+                                if token.cancelled or _error_code(exc) in CANCEL_CODES:
+                                    raise
+                                # One bad column must not sink the others: search them one by one,
+                                # skipping hits the failed scan already delivered.
+                                for col in unit:
+                                    _retry_column(conn, col, args, seen.get(col, set()), results, on_skip)
                     finally:
                         token.unregister(conn)
                         if opts.time_limit:
@@ -525,10 +595,7 @@ def search(
                 for col in unit:
                     results.put(_Skipped(col, exc))
 
-        if SINGLE_SCAN_PER_TABLE:
-            units = [cols for cols in tables.values()]
-        else:
-            units = [[col] for col in columns]
+        units = _plan_units(tables, opts)
         total = len(units)
         for unit in units:
             executor.submit(work, unit).add_done_callback(lambda f, unit=unit: results.put((_DONE, f, unit)))

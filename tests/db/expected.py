@@ -77,3 +77,13 @@ RESERVED_HITS = {
 }
 
 UNICODE_EDGE = ("SCOUT_ODD", "Unicode Edge")  # columns TXT and NARROW; see seed.sql
+
+# 60 string columns C01..C60; 'widehit' is in C01, C20, C21, C40, C41 and C60 (see seed.sql). Columns are
+# searched in groups of at most 20, so 20|21 and 40|41 are the group boundaries.
+WIDE_TABLE = ("SCOUT_ODD", "WIDE_60")
+WIDE_HIT_COLUMNS = {"C01": 2, "C20": 1, "C21": 2, "C40": 1, "C41": 1, "C60": 2}  # hits per column
+
+# NOTE can be searched; V (a virtual column that divides by zero on row 3) cannot, and must be skipped alone
+VIRT_NOTE = ("SCOUT_VIRT", "VIRT_ERR", "NOTE")
+VIRT_BAD = ("SCOUT_VIRT", "VIRT_ERR", "V")
+VIRT_NOTE_HITS = {"virtneedle first", "virtneedle third", "virtneedle fourth"}

@@ -14,7 +14,7 @@ from scout import db
 from scout.config import ConnectionConfig
 
 SEED = Path(__file__).with_name("seed.sql")
-USERS = ("scout_hr", "scout_docs", "scout_odd", "scout_hidden", "scout_broken", "scout_reader")
+USERS = ("scout_hr", "scout_docs", "scout_odd", "scout_hidden", "scout_broken", "scout_virt", "scout_reader")
 
 
 def statements(sql: str, reader_password: str):

@@ -3,7 +3,7 @@ import pytest
 from scout.search import SearchOptions, search
 from tests.db import expected as ex
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("scan_mode")]
 
 
 def keys(cfg, threads, **kw):

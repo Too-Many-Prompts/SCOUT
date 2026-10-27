@@ -5,7 +5,7 @@ from scout.config import ConnectionConfig
 from scout.search import SearchOptions, search
 from tests.db import expected as ex
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("scan_mode")]
 
 TERMS = ["report", "quick", "albert", "colo*r", "zebra", "lateneedle"]
 
@@ -244,28 +244,46 @@ def test_nls_lower_never_misses_a_regex_match_for_the_safe_characters(reader_con
 def single_scan(monkeypatch):
     from scout import search as search_mod
 
-    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", True)
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_MIN_BLOCKS", 0)
 
 
 def outcome_summary(outcomes):
     return {col_key(o.column): (o.examples, o.more_available, o.timed_out) for o in outcomes}
 
 
+VARIANTS = [
+    {}, {"whole_word": True}, {"case_sensitive": True}, {"whole_word": True, "case_sensitive": True},
+]
+
+
+@pytest.mark.parametrize("variant", VARIANTS, ids=lambda v: "+".join(v) or "default")
 @pytest.mark.parametrize("term", TERMS + ["the", "fi"])
 @pytest.mark.parametrize("limit", [None, 1, 2])
-def test_single_scan_gives_the_same_columns_matches_and_outcomes(reader_config, monkeypatch, term, limit):
+def test_single_scan_gives_the_same_columns_matches_and_outcomes(reader_config, monkeypatch, term, limit, variant):
     from scout import search as search_mod
 
-    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", False)
-    per_col, out_a = run(reader_config, term, limit_per_column=limit)
-    monkeypatch.setattr(search_mod, "SINGLE_SCAN_PER_TABLE", True)
-    per_tab, out_b = run(reader_config, term, limit_per_column=limit)
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_MIN_BLOCKS", None)
+    per_col, out_a = run(reader_config, term, limit_per_column=limit, **variant)
+    monkeypatch.setattr(search_mod, "SINGLE_SCAN_MIN_BLOCKS", 0)
+    per_tab, out_b = run(reader_config, term, limit_per_column=limit, **variant)
     assert outcome_summary(out_a) == outcome_summary(out_b)
     if limit is None:
         assert {m.key for m in per_col} == {m.key for m in per_tab}
     else:  # which examples come back may differ; they must still be real hits
-        complete, _ = run(reader_config, term)
+        complete, _ = run(reader_config, term, **variant)
         assert {m.key for m in per_tab} <= {m.key for m in complete}
+
+
+@pytest.mark.parametrize("terms", [("quick", "brown"), ("brown", "fox", "jumps"), ("the", "lazy")])
+def test_a_phrase_gives_the_same_matches_either_way(reader_config, monkeypatch, terms):
+    from scout import search as search_mod
+
+    results = []
+    for blocks in (None, 0):
+        monkeypatch.setattr(search_mod, "SINGLE_SCAN_MIN_BLOCKS", blocks)
+        matches = list(search(reader_config, SearchOptions(terms=terms, schemas=ex.SCHEMAS, threads=4)))
+        results.append({m.key for m in matches})
+    assert results[0] == results[1] and results[0]
 
 
 def test_single_scan_reports_a_broken_table_once_per_column(reader_config, single_scan):
@@ -341,3 +359,33 @@ def test_case_folding_proof_holds_under_other_nls_settings(reader_config, nls):
                 assert cur.fetchone()[0] == 1, (text, pat, nls)
     finally:
         conn.close()
+
+
+# ---- wide tables (searched in groups of 20 columns) and a column that cannot be read
+
+def test_every_column_of_a_wide_table_is_searched_whichever_group_it_falls_in(reader_config):
+    matches, outcomes = run(reader_config, "widehit", schemas=("SCOUT_ODD",))
+    per_column = {}
+    for m in matches:
+        if (m.owner, m.table) == ex.WIDE_TABLE:
+            per_column[m.column] = per_column.get(m.column, 0) + 1
+    assert per_column == ex.WIDE_HIT_COLUMNS  # C20|C21 and C40|C41 sit on group boundaries
+    wide = [o for o in outcomes if (o.column.owner, o.column.table) == ex.WIDE_TABLE]
+    assert len(wide) == 60  # one outcome per column, hits or not
+
+
+def test_locate_mode_on_a_wide_table_counts_each_column_on_its_own(reader_config):
+    _, outcomes = run(reader_config, "widehit", schemas=("SCOUT_ODD",), limit_per_column=1)
+    got = {o.column.column: (o.examples, o.more_available) for o in outcomes if (o.column.owner, o.column.table) == ex.WIDE_TABLE}
+    for column, total in ex.WIDE_HIT_COLUMNS.items():
+        assert got[column] == (1, total > 1), column
+    assert got["C02"] == (0, False)
+
+
+def test_an_unreadable_column_is_skipped_alone(reader_config):
+    skipped, outcomes = [], []
+    opts = SearchOptions(terms=("virtneedle",), schemas=("SCOUT_VIRT",), threads=2)
+    matches = list(search(reader_config, opts, on_skip=lambda c, e: skipped.append(col_key(c)), on_column=outcomes.append))
+    assert {m.value for m in matches if (m.owner, m.table, m.column) == ex.VIRT_NOTE} == ex.VIRT_NOTE_HITS
+    assert skipped == [ex.VIRT_BAD]  # NOTE is not among them
+    assert ex.VIRT_NOTE in {col_key(o.column) for o in outcomes}
