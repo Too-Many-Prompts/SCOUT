@@ -644,6 +644,7 @@ def search(
             executor.submit(work, unit).add_done_callback(lambda f, unit=unit: results.put(_Done(f, unit)))
 
         done = 0
+        yielded: Counter = Counter()  # matches handed to the caller, per column address
         while done < total:
             try:
                 item = results.get(timeout=HEARTBEAT_SECONDS)
@@ -653,11 +654,20 @@ def search(
                 emit()
                 continue
             if isinstance(item, Match):
+                # Workers outrun a slow caller (a UI adds one row at a time), so after a cancel the
+                # queue can still hold thousands of matches: drop them, the caller asked to stop.
+                if token.cancelled:
+                    continue
                 hits += 1
+                yielded[item.address] += 1
                 yield item
             elif isinstance(item, _Started):
                 started.setdefault((item.owner, item.table), item.at)
             elif isinstance(item, ColumnOutcome):
+                if token.cancelled:  # count only what the caller got; dropped hits mean "more"
+                    given = yielded[item.column.address]
+                    item = replace(item, examples=given,
+                                   more_available=item.more_available or given < item.examples)
                 if on_column:
                     on_column(item)
                 if item.timed_out and not item.examples:

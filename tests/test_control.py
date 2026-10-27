@@ -154,6 +154,20 @@ def test_cancel_interrupts_a_running_statement_without_reporting_a_skip(monkeypa
     assert out == [] and skipped == [] and time.monotonic() - start < 3
 
 
+def test_cancel_drops_matches_already_queued_and_the_outcome_counts_only_those_handed_over(monkeypatch):
+    rows = [(f"R{i}", "needle") for i in range(2000)]  # far more than a slow consumer has taken
+    fake = FakeDb(TWO_TABLES[:1], {"C1": lambda cur, conn: rows})
+    fake.patch(monkeypatch)
+    token, outcomes = CancelToken(), []
+    gen = search(CFG, opts(), on_column=outcomes.append, cancel=token)
+    next(gen)
+    time.sleep(0.2)  # let the worker queue the rest
+    token.cancel()
+    assert list(gen) == []
+    [outcome] = outcomes
+    assert (outcome.examples, outcome.more_available) == (1, True)
+
+
 def test_an_early_close_stops_workers_and_leaves_the_callers_token_unset(monkeypatch):
     fake = FakeDb(TWO_TABLES, {"C1": hit, "C2": hit, "C3": hit})
     fake.patch(monkeypatch)
