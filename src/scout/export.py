@@ -30,7 +30,8 @@ def write_csv(
 
     Matches that carry a rowid add a last `sql_query` column: a SELECT of the whole row by rowid
     to paste into SQL Developer (a rowid stays valid until the row is moved or the table rebuilt)."""
-    rows = sorted(matches, key=lambda m: (m.owner, m.table, m.column, m.value, m.rowid or ""))
+    rows = sorted(matches, key=lambda m: (m.owner, m.table, m.column, m.value, m.rowid or "",
+                                         m.snippet.position or 0 if m.snippet is not None else 0))
     snippets = any(m.snippet is not None for m in rows)
     queries = any(m.rowid for m in rows)
     header = CSV_HEADER + (("more_in_value",) if snippets else ())

@@ -527,6 +527,7 @@ class ScoutApp(App):
                 limit_per_column=None if every_hit else DEFAULT_LOCATE_LIMIT,
                 time_limit=None if every_hit else DEFAULT_TIME_LIMIT,
                 snippet_context=SNIPPET_CONTEXT,
+                every_occurrence=every_hit,
             )
             build_regex(opts)
         except ValueError as exc:
@@ -645,7 +646,7 @@ class ScoutApp(App):
         self._start_results(limited=False)  # a single column, complete: exports without the complete column
         self._show_hits()
         self._status(f"Fetching every hit in {ref}...")
-        every = replace(self.opts, limit_per_column=None, time_limit=None)
+        every = replace(self.opts, limit_per_column=None, time_limit=None, every_occurrence=True)
         self._drill_worker(self.session, outcome.column, every, self.token, ref)
 
     def _selected_outcome(self) -> ColumnOutcome | None:

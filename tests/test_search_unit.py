@@ -294,3 +294,30 @@ def test_more_in_value_check_is_prechecked_and_detail_skips_it():
 def test_window_start_steps_off_a_lone_surrogate():
     sql = _snippet_sql([Column("S", "T", "C", "CLOB")], None, False)
     assert "UNISTR('\\FFFD')" in sql
+
+
+def test_every_occurrence_walks_the_value_by_rowid_without_a_precheck():
+    # first scan row: rowid + before, hit, after, cut_before, cut_after, more, position, end
+    first = ("R1", "", "ab", " ", 0, 0, 1, 1, 3)
+    conn = _conn_with_rows([])
+    cur = conn.cursor.return_value
+    cur.fetchmany.side_effect = [[first], []]
+    cur.fetchone.side_effect = [("R1", " ", "ab", " ", 0, 0, 1, 5, 7), ("R1", " ", "ab", "", 0, 0, 0, 9, 11)]
+    col = Column("S", "T", "C", "CLOB")
+    from scout.search import _SnippetQuery
+    gen = _search_column(conn, col, "p", "i", MagicMock(is_set=lambda: False), literal="ab", fold=True,
+                         snippet=_SnippetQuery(0, 0, 20), expand=True)
+    got = []
+    while True:
+        try:
+            got.append(next(gen))
+        except StopIteration as done:
+            outcome = done.value
+            break
+    assert [m.snippet.position for m in got] == [1, 5, 9]
+    assert not any(m.snippet.more_in_value for m in got)
+    assert outcome.examples == 3 and not outcome.more_available
+    follow = cur.execute.call_args_list[1]  # the first call is the scan
+    assert "NLS_LOWER" not in follow.args[0] and ":lit" not in follow.args[0]
+    assert follow.kwargs["from_at"] == 3 and follow.kwargs["rid"] == "R1"
+    assert cur.execute.call_args_list[2].kwargs["from_at"] == 7

@@ -189,3 +189,31 @@ def test_whole_word_proximity_hit_excludes_boundaries_and_sees_the_second_pair(s
                          snippet_context=SNIPPET_CONTEXT)
     (m,) = list(search(reader_config, opts))
     assert m.snippet.hit == "albert einstein" and m.snippet.more_in_value
+
+
+def test_every_occurrence_lists_each_hit_in_a_value(run):
+    got = [m for m in run("albert", every_occurrence=True) if m.value.startswith("x albert")]
+    assert [m.snippet.hit for m in got] == ["albert", "albert"]
+    assert len({m.snippet.position for m in got}) == 2 and not any(m.snippet.more_in_value for m in got)
+
+
+def test_every_occurrence_whole_word_sees_adjacent_hits(run):
+    got = [m for m in run("albert", whole_word=True, every_occurrence=True) if m.value.startswith("x albert")]
+    assert len(got) == 2 and len({m.snippet.position for m in got}) == 2
+
+
+def test_every_occurrence_finds_a_far_second_hit(run):
+    got = run("zqtwo", every_occurrence=True)
+    assert len(got) == 2 and got[0].rowid == got[1].rowid
+
+
+def test_every_occurrence_off_keeps_one_hit_per_value(run):
+    assert len(run("zqtwo")) == 1
+
+
+def test_every_occurrence_proximity_lists_each_pair(snip_tiny, reader_config):
+    opts = SearchOptions(terms=("albert", "einstein"), near=1, whole_word=True, schemas=(SCHEMA,), threads=2,
+                         snippet_context=SNIPPET_CONTEXT, every_occurrence=True)
+    got = list(search(reader_config, opts))
+    assert len(got) == 2 and all(m.snippet.hit == "albert einstein" for m in got)
+    assert len({m.snippet.position for m in got}) == 2

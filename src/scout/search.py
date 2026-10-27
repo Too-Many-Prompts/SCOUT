@@ -43,6 +43,9 @@ class SearchOptions:
     # characters of context each side of the first match; Match.value is then that snippet, cut by
     # Oracle (None = the whole value, as library callers and the contract tests expect)
     snippet_context: int | None = None
+    # list every occurrence of a match in a value as its own hit, not just the first (needs
+    # snippet_context; for the "all hits" modes, with no limit_per_column)
+    every_occurrence: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ class Snippet:
     # where the hit starts, in Oracle's own units (opaque here): lets fetch_detail search from
     # the hit instead of rescanning a huge value from its start
     position: int | None = field(default=None, compare=False)
+    # where the hit ends, in the same units: the next occurrence is searched from here
+    end_position: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -321,7 +326,7 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool, where_extr
     """One statement that finds and cuts the first match in each column of one table.
 
     Selects the ROWID, then per column: before, hit, after, cut_before, cut_after, more (0/1),
-    position, then `extra_select` (written against the aliases "SCOUT$C<i>"). Binds :pat :flags :sub
+    position, end position, then `extra_select` (written against the aliases "SCOUT$C<i>"). Binds :pat :flags :sub
     :back :ctx (and :lit). The innermost view computes each match position once: ROWNUM keeps
     Oracle from merging it, which would evaluate the regex again wherever the position is used
     (measured: 111 s instead of 37-48 s on a 97 MB CLOB). `start`: where the search begins (an SQL
@@ -353,6 +358,7 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool, where_extr
             f"CASE WHEN {si} > 0 AND {hi} + :ctx <= LENGTH({ci}) THEN 1 ELSE 0 END",
             f"CASE WHEN {si} > 0 THEN {_more_check(ci, hi, literal, fold)} ELSE 0 END" if more else "0",
             si,
+            hi,
         ]
     if extra_select:
         pieces.append(extra_select)
@@ -361,11 +367,46 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool, where_extr
 
 def _snippet_match(col: Column, rowid, pieces) -> Match | None:
     """The Match for one column of a snippet row (None when that column did not match)."""
-    before, hit, after, cut_before, cut_after, more, position = pieces
+    before, hit, after, cut_before, cut_after, more, position, end = pieces
     if hit is None:
         return None
-    snip = Snippet(before or "", hit, after or "", bool(cut_before), bool(cut_after), bool(more), int(position))
+    snip = Snippet(before or "", hit, after or "", bool(cut_before), bool(cut_after), bool(more),
+                   int(position), None if end is None else int(end))
     return Match(col.owner, col.table, col.column, snip.before + snip.hit + snip.after, str(rowid), snip)
+
+
+def _occurrences(
+    conn: oracledb.Connection,
+    col: Column,
+    first: Match,
+    pattern: str,
+    flags: str,
+    snippet: _SnippetQuery,
+    stop: threading.Event,
+    deadline: float | None,
+) -> Generator[Match, None, str | None]:
+    """Yield the occurrences after `first` in its value, one Match each, found by rowid one after
+    another (each search starts where the previous hit ended). Returns "stop" or "timeout" when
+    cut short, else None. No substring pre-check: for one known row it would lowercase the whole
+    value at every step (see fetch_detail); the more-in-value check says when to stop."""
+    sql = _snippet_sql([col], None, False, where_extra="ROWID = CHARTOROWID(:rid)",
+                       start="GREATEST(:from_at - :back, 1)")
+    at = first.snippet.end_position
+    more = first.snippet.more_in_value
+    with conn.cursor() as cur:
+        while more and at is not None:
+            if stop.is_set():
+                return "stop"
+            if not _arm(conn, deadline):
+                return "timeout"
+            cur.execute(sql, pat=pattern, flags=flags, rid=first.rowid, from_at=at, **snippet.binds())
+            row = cur.fetchone()
+            found = None if row is None else _snippet_match(col, row[0], row[1:])
+            if found is None or (found.snippet.end_position or 0) <= at:  # row gone or changed
+                return None
+            more, at = found.snippet.more_in_value, found.snippet.end_position
+            yield replace(found, snippet=replace(found.snippet, more_in_value=False))
+    return None
 
 
 def _search_column(
@@ -379,6 +420,7 @@ def _search_column(
     fold: bool = False,
     deadline: float | None = None,
     snippet: _SnippetQuery | None = None,
+    expand: bool = False,
 ) -> Generator[Match, None, ColumnOutcome]:
     """Yield the column's matches (at most `limit`); returns its ColumnOutcome.
 
@@ -386,7 +428,8 @@ def _search_column(
     `fold` says the search is case-insensitive, so the column is lowercased first. `deadline`
     (time.monotonic() value) caps the whole query: call_timeout limits one round trip, so it is
     re-armed with the time left before every fetch. A column cut short by `stop` is returned as
-    `more_available`, never as complete."""
+    `more_available`, never as complete. `expand` (with a snippet) yields every occurrence in a
+    value as its own Match, not just the first."""
     # identifiers come from discover_columns (the dictionary) and are quoted; the term is a bind
     name = _quote(col.column)
     binds: dict[str, object] = {"pat": pattern, "flags": flags}
@@ -426,8 +469,25 @@ def _search_column(
                     examples += 1
                     if snippet is None:
                         yield Match(col.owner, col.table, col.column, values[0], str(rowid))
-                    else:
+                    elif not expand:
                         yield _snippet_match(col, rowid, values)
+                    else:
+                        first = _snippet_match(col, rowid, values)
+                        yield replace(first, snippet=replace(first.snippet, more_in_value=False))
+                        later = _occurrences(conn, col, first, pattern, flags, snippet, stop, deadline)
+                        status = None
+                        while True:
+                            try:
+                                extra = next(later)
+                            except StopIteration as done:
+                                status = done.value
+                                break
+                            examples += 1
+                            yield extra
+                        if status == "timeout":
+                            return ColumnOutcome(col, examples, more, timed_out=True)
+                        if status == "stop":
+                            break  # the loop head sees `stop` and ends the column as "more available"
     except oracledb.DatabaseError as exc:
         if _error_code(exc) in TIMEOUT_CODES:  # keep what was found; the caller flags it
             return ColumnOutcome(col, examples, more, timed_out=True)
@@ -457,6 +517,7 @@ def _search_table(
     fold: bool = False,
     deadline: float | None = None,
     snippet: _SnippetQuery | None = None,
+    expand: bool = False,
 ) -> Generator[Match, None, list[ColumnOutcome]]:
     """Search every column of one table in a single scan; returns one ColumnOutcome per column.
 
@@ -475,8 +536,9 @@ def _search_table(
     else:
         sql = _snippet_sql(cols, literal, fold)
         binds.update(snippet.binds())
-    width = 1 if snippet is None else 7  # values per column in each row
+    width = 1 if snippet is None else 8  # values per column in each row
     counts, more, timed_out = [0] * len(cols), [False] * len(cols), False
+    status = None
     if stop.is_set():
         return [ColumnOutcome(c, 0, True) for c in cols]
     try:
@@ -506,8 +568,29 @@ def _search_table(
                             counts[i] += 1
                             if snippet is None:
                                 yield Match(col.owner, col.table, col.column, pieces[0], str(rowid))
-                            else:
+                            elif not expand:
                                 yield _snippet_match(col, rowid, pieces)
+                            else:
+                                first = _snippet_match(col, rowid, pieces)
+                                yield replace(first, snippet=replace(first.snippet, more_in_value=False))
+                                later = _occurrences(conn, col, first, pattern, flags, snippet, stop, deadline)
+                                status = None
+                                while True:
+                                    try:
+                                        extra = next(later)
+                                    except StopIteration as done:
+                                        status = done.value
+                                        break
+                                    counts[i] += 1
+                                    yield extra
+                                if status == "timeout":
+                                    timed_out = True
+                                elif status == "stop":
+                                    more = [True] * len(cols)
+                                if status is not None:
+                                    break
+                if status is not None:
+                    break
                 if limit is not None and all(more):
                     break
     except oracledb.DatabaseError as exc:
@@ -580,7 +663,7 @@ def drill_down(
                 gen = _search_column(
                     conn, column, pattern, flags, token,
                     literal=literal, fold=not opts.case_sensitive, deadline=_deadline(opts),
-                    snippet=snippet,
+                    snippet=snippet, expand=snippet is not None,
                 )
                 outcome = None
                 try:
@@ -605,6 +688,11 @@ def _column_of(unit: list[Column], m: Match) -> Column:
     return next(c for c in unit if c.column == m.column)
 
 
+def _hit_key(m: Match) -> tuple:
+    """Identifies one hit: a rowid, plus where in the value when every occurrence is listed."""
+    return (m.rowid, m.snippet.position if m.snippet is not None else None)
+
+
 def _retry_column(conn, col: Column, query: dict, seen: set, results: "queue.Queue", on_skip) -> None:
     """Search one column on its own after a combined scan failed, without repeating hits already
     delivered. With a limit, the column still ends with at most `limit` examples in total.
@@ -614,12 +702,12 @@ def _retry_column(conn, col: Column, query: dict, seen: set, results: "queue.Que
 
     def deliver(m: Match) -> None:
         nonlocal delivered, capped
-        if m.rowid in seen:
+        if _hit_key(m) in seen:
             return
         if limit is not None and delivered >= limit:
             capped = True
             return
-        seen.add(m.rowid)
+        seen.add(_hit_key(m))
         delivered += 1
         results.put(m)
 
@@ -745,15 +833,15 @@ def search(
                         query = dict(
                             pattern=pattern, flags=flags, stop=token, limit=opts.limit_per_column,
                             literal=literal, fold=not opts.case_sensitive, deadline=_deadline(opts),
-                            snippet=snippet,
+                            snippet=snippet, expand=opts.every_occurrence and snippet is not None,
                         )
                         if len(unit) == 1:
                             results.put(_drain(_search_column(conn, unit[0], **query), results.put))
                         else:
-                            seen: dict[Column, set] = {}  # rowids already delivered, per column
+                            seen: dict[Column, set] = {}  # hits already delivered, per column
 
                             def deliver(m: Match) -> None:
-                                seen.setdefault(_column_of(unit, m), set()).add(m.rowid)
+                                seen.setdefault(_column_of(unit, m), set()).add(_hit_key(m))
                                 results.put(m)
 
                             try:

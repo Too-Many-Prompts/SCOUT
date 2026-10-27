@@ -15,7 +15,7 @@ snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-sn
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`), and the TUI whole-row sheet (`search.fetch_row`
 by rowid; TUI only, see "Front-end conventions"). Not implemented yet: any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 723 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 736 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -44,6 +44,10 @@ Status: 723 tests pass with the database up (integration tests run once per scan
   contract tests see complete results. Every searched column reports one `ColumnOutcome`
   (`on_column`); `drill_down` / `resolve_column` / `--column REF` / shell `more REF` / TUI "Show all
   hits" fetch every hit for one column. Locate-mode CSV gains a `complete` column (`no` = examples only).
+- **All hits means every occurrence:** with `every_occurrence` (CLI `--all`/`--column`, shell `more REF`, TUI "every hit"
+  and "Show all hits"; `drill_down` always) each occurrence in a value is its own `Match`, found by `_occurrences`
+  (rowid fetches from `Snippet.end_position`, no pre-check, one round trip each). Locate mode shows the first match
+  per value with `more_in_value`. Retry dedup and the CSV sort key include `Snippet.position`.
 - **Snippets (the CLI, shell and TUI always ask for them):** `SearchOptions.snippet_context` (`SNIPPET_CONTEXT` = 20
   characters each side; library default `None` = whole values, so `tests/db/expected.py` is unchanged). Oracle cuts
   the first match (`_snippet_sql`) and returns `before`/`hit`/`after` as strings in `Match.snippet`, never positions

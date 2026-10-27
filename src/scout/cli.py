@@ -140,7 +140,7 @@ def _shell_loop(session: db.Session) -> None:
             elif len(rest) != 1:
                 typer.echo("Usage: more OWNER.TABLE.COLUMN", err=True)
             else:
-                every = replace(session.last_opts, limit_per_column=None, time_limit=None)
+                every = replace(session.last_opts, limit_per_column=None, time_limit=None, every_occurrence=True)
                 try:
                     if not _drill(session, every, rest[0], None):
                         _error(f"No searchable column {rest[0]!r}.")
@@ -245,6 +245,7 @@ def _search_options(
         limit_per_column=DEFAULT_LOCATE_LIMIT if locate else None,
         time_limit=time_limit,
         snippet_context=SNIPPET_CONTEXT,
+        every_occurrence=not locate,
     )
     try:
         build_regex(opts)
