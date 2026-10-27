@@ -9,10 +9,14 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import oracledb
 
 from scout.config import ConnectionConfig
+
+if TYPE_CHECKING:
+    from scout.search import SearchOptions
 
 _init_lock = threading.Lock()
 _client_initialized = False
@@ -77,7 +81,7 @@ class Session:
     cfg: ConnectionConfig
     schemas: tuple[str, ...]
     pool: oracledb.ConnectionPool
-    last_opts: object | None = None  # the shell's most recent SearchOptions, for `more`
+    last_opts: "SearchOptions | None" = None  # the shell's most recent SearchOptions, for `more`
 
     def close(self) -> None:
         self.pool.close(force=True)

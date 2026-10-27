@@ -17,6 +17,7 @@ from scout.config import (
     default_schemas,
     default_threads,
     load_defaults,
+    parse_schemas,
 )
 from scout.control import CancelToken, Progress
 from scout.export import write_csv
@@ -406,10 +407,11 @@ def _connection_config(
     user = typer.prompt("Username")
     password = typer.prompt("Password", hide_input=True)
     service_name = typer.prompt("Service name", default=cfg.service_name)
+    prefill = schema or default_schemas()
     schema_text = typer.prompt(
         "Schema to search (comma-separated, blank = all visible)",
-        default=",".join(schema or default_schemas()),
-        show_default=bool(schema or default_schemas()),
+        default=",".join(prefill),
+        show_default=bool(prefill),
     )
-    schemas = tuple(s.strip() for s in schema_text.split(",") if s.strip())
+    schemas = parse_schemas(schema_text)
     return cfg.with_overrides(user=user, password=password, service_name=service_name), schemas

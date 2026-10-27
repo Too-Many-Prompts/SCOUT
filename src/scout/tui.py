@@ -21,6 +21,7 @@ from scout.config import (
     default_schemas,
     default_threads,
     load_defaults,
+    parse_schemas,
 )
 from scout.control import CancelToken, Progress
 from scout.export import write_csv
@@ -155,7 +156,7 @@ class LoginScreen(Screen):
                 return self._fail("Error: port must be a number")
             if not cfg.user or not cfg.password:
                 return self._fail("Error: user and password are required")
-            schemas = tuple(s.strip() for s in self._text("login-schema").split(",") if s.strip())
+            schemas = parse_schemas(self._text("login-schema"))
             self.query_one("#login-button", Button).disabled = True
             err = self.query_one("#login-error", Label)
             err.add_class("busy")

@@ -63,10 +63,14 @@ def load_defaults() -> ConnectionConfig:
     )
 
 
+def parse_schemas(text: str) -> tuple[str, ...]:
+    """'a, b,,c' -> ('a', 'b', 'c'); blank means every visible schema."""
+    return tuple(s.strip() for s in text.split(",") if s.strip())
+
+
 def default_schemas() -> tuple[str, ...]:
     """Schema(s) pre-filled at login (blank = every visible schema)."""
-    raw = os.environ.get("SCOUT_DB_SCHEMA") or _read_defaults_file().get("schema", "")
-    return tuple(s.strip() for s in raw.split(",") if s.strip())
+    return parse_schemas(os.environ.get("SCOUT_DB_SCHEMA") or _read_defaults_file().get("schema", ""))
 
 
 def default_threads() -> int:
