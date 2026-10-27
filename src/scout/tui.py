@@ -112,8 +112,8 @@ VANISHED = "This row no longer matches (it changed after the search)."
 def detail_text(d: Detail) -> tuple[str, tuple[int, int], tuple[int, int]]:
     """The detail window's text and the hit's (row, column) start and end in it.
 
-    Line breaks are normalised to \\n first (the Gutenberg texts use \\r\\n), so the
-    locations count each break once, as the TextArea does."""
+    \\r\\n and \\r become \\n first (the Gutenberg texts use \\r\\n); the locations follow the
+    TextArea's own line splitting (see _location)."""
     s = d.snippet
     before, hit, after = (re.sub(r"\r\n?", "\n", p) for p in (s.before, s.hit, s.after))
     before = (CUT if s.cut_before else "") + before
@@ -122,8 +122,15 @@ def detail_text(d: Detail) -> tuple[str, tuple[int, int], tuple[int, int]]:
 
 
 def _location(text: str) -> tuple[int, int]:
-    """The (row, column) just after `text`."""
-    return text.count("\n"), len(text) - (text.rfind("\n") + 1)
+    """The (row, column) just after `text`, splitting lines as the TextArea's Document does
+    (str.splitlines: form feeds, U+2028 and other separators break lines too)."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return 0, 0
+    last = lines[-1]
+    if last.splitlines()[0] != last:  # text ends with a line break: the next row starts
+        return len(lines), 0
+    return len(lines) - 1, len(last)
 
 
 def detail_note(d: Detail) -> str:

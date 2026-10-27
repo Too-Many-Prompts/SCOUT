@@ -213,10 +213,22 @@ def test_snippet_regex_captures_the_word_in_whole_word_mode():
 
 
 def test_snippet_regex_is_build_regex_otherwise():
-    for o in (SearchOptions(terms=("albert",)), SearchOptions(terms=("a", "b"), near=2, whole_word=True)):
+    for o in (SearchOptions(terms=("albert",)), SearchOptions(terms=("a", "b"), near=2)):
         assert snippet_regex(o)[:2] == build_regex(o) and snippet_regex(o)[2:] == (0, 0)
 
 
 def test_snippet_regex_refuses_what_build_regex_refuses():
     with pytest.raises(ValueError):
         snippet_regex(SearchOptions(terms=("**",), whole_word=True))
+
+
+def test_snippet_regex_captures_the_proximity_span_in_whole_word_mode():
+    o = SearchOptions(terms=("albert", "einstein"), near=1, whole_word=True)
+    pat, flags, sub, back = snippet_regex(o)
+    assert (sub, back) == (2, 1) and pat.startswith(f"(^|{NW})(") and pat.endswith(f")({NW}|$)")
+
+    def py(p):
+        return p.replace("[[:alnum:]_]", r"\w").replace("[^[:alnum:]_]", r"\W")
+
+    for text in ("albert einstein", "einstein, albert", "x albert y einstein", "alberts einstein"):  # same matches
+        assert bool(re.search(py(pat), text, re.I)) == bool(re.search(py(build_regex(o)[0]), text, re.I))

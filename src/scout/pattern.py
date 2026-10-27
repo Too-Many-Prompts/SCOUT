@@ -79,7 +79,7 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
 def snippet_regex(opts: "SearchOptions") -> tuple[str, str, int, int]:
     """(pattern, flags, subexpression, back) for cutting a snippet with REGEXP_INSTR.
 
-    Matches exactly what build_regex matches. For a whole-word phrase the searched text is
+    Matches exactly what build_regex matches. For a whole-word phrase or proximity search the searched text is
     captured as subexpression 2, so the hit excludes the boundary characters the pattern
     consumes, and `back` = 1: the match itself starts up to one character before the hit.
     Otherwise the hit is the whole match (subexpression 0, back 0)."""
@@ -105,10 +105,13 @@ def _build(opts: "SearchOptions", capture: bool) -> tuple[str, str, bool]:
         a, b = (_core(t) for t in singles)
         rest_of_word = f"{W}*" if contains else ""  # default mode: a word may run on past the term
         gap = f"{NW}+({W}+{NW}+){{0,{opts.near - 1}}}{rest_of_word}"
-        pattern = (
-            f"({lead}{a}{rest_of_word}{gap}{b}{end}|{lead}{b}{rest_of_word}{gap}{a}{end})"
-        )
-        captured = False  # a proximity hit is the whole span
+        captured = capture and not contains
+        if captured:  # the same matches, with the boundaries factored out of the span (group 2)
+            pattern = f"{lead}({a}{rest_of_word}{gap}{b}|{b}{rest_of_word}{gap}{a}){end}"
+        else:
+            pattern = (
+                f"({lead}{a}{rest_of_word}{gap}{b}{end}|{lead}{b}{rest_of_word}{gap}{a}{end})"
+            )
     else:
         tokens = _words(opts)
         if not tokens:

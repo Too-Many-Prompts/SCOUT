@@ -726,3 +726,14 @@ async def test_detail_for_vanished_row_says_so(monkeypatch):
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
         assert "no longer matches" in str(app.screen.query_one("#detail-note").render())
+
+
+def test_detail_location_follows_the_text_areas_line_breaks():
+    from textual.document._document import Document
+
+    from scout.search import Detail, Snippet
+    from scout.tui import detail_text
+
+    for brk in ("\n", "\r\n", "\r", "\x0c", "\x0b", "\x85", "\u2028", "\u2029", "\x1c"):
+        text, start, end = detail_text(Detail(Snippet(f"p1{brk}p2 ", "zq", f" e{brk}nd", False, False, False), 9))
+        assert Document(text).get_text_range(start, end) == "zq", repr(brk)

@@ -22,6 +22,11 @@ ROWS = [
     (5, None, "short zqtiny", None),
     (6, None, "x" * 5_000_000 + " zqhuge", None),
     (7, None, "zqtwo " + "y" * 100 + " zqtwo end", None),
+    # the window's left edge (hit start - 20 UTF-16 units) lands inside the emoji: ORA-22831 unless handled
+    (8, None, "😀" + "a" * 19 + "zqodd", "😀" + "a" * 19 + "zqodd"),
+    # the same at the detail window's edge (hit start - 100,000 units)
+    (9, None, "😀" + "b" * 99_999 + "zqdet", None),
+    (10, "say albert einstein albert einstein ok", None, None),
 ]
 
 
@@ -80,7 +85,7 @@ def test_short_value_comes_back_whole(run):
 
 
 def test_whole_word_hit_excludes_boundaries_and_sees_adjacent_second_hit(run):
-    (m,) = run("albert", whole_word=True)
+    (m,) = [m for m in run("albert", whole_word=True) if m.value.startswith("x albert")]
     assert m.snippet.hit == "albert" and m.snippet.more_in_value and m.value == "x albert albert y"
 
 
@@ -164,3 +169,23 @@ def test_cli_prints_the_snippet_line(snip_tiny, reader_config):
     )
     assert result.exit_code == 0, result.output
     assert f"{SCHEMA}.T.C\t…{'a' * 19} zqsnip {'b' * 19}…\n" in result.stdout
+
+
+@pytest.mark.parametrize("column", ["C", "N"])
+def test_left_edge_inside_an_emoji_is_moved_to_the_next_character(run, column):
+    hits = [m for m in run("zqodd") if m.column == column]
+    (m,) = hits
+    assert m.snippet.before == "a" * 19 and m.snippet.hit == "zqodd" and m.snippet.cut_before
+
+
+def test_detail_left_edge_inside_an_emoji(run, fresh_reader):
+    (m,) = run("zqdet")
+    d = fetch_detail(fresh_reader, m, opts_for("zqdet"))
+    assert d.snippet.before == "b" * 99_999 and d.snippet.cut_before
+
+
+def test_whole_word_proximity_hit_excludes_boundaries_and_sees_the_second_pair(snip_tiny, reader_config):
+    opts = SearchOptions(terms=("albert", "einstein"), near=1, whole_word=True, schemas=(SCHEMA,), threads=2,
+                         snippet_context=SNIPPET_CONTEXT)
+    (m,) = list(search(reader_config, opts))
+    assert m.snippet.hit == "albert einstein" and m.snippet.more_in_value

@@ -282,3 +282,15 @@ def test_detail_skips_the_substring_precheck_and_starts_at_the_hit():
     assert "NLS_LOWER" not in call.args[0] and ":lit" not in call.args[0]
     assert "REGEXP_INSTR(\"C\", :pat, GREATEST(:hit_at - :back, 1), 1, 0, :flags, :sub)" in call.args[0]
     assert call.kwargs["hit_at"] == 42 and call.kwargs["rid"] == "AAAR1"
+
+
+def test_more_in_value_check_is_prechecked_and_detail_skips_it():
+    sql = _snippet_sql([Column("S", "T", "C", "CLOB")], literal="abc", fold=True)
+    assert 'INSTR(NLS_LOWER("SCOUT$C1", \'NLS_SORT=BINARY\'), :lit, "SCOUT$H1") > 0' in sql
+    detail = _snippet_sql([Column("S", "T", "C", "CLOB")], None, True, more=False)
+    assert 'REGEXP_INSTR("SCOUT$C1", :pat, "SCOUT$H1"' not in detail
+
+
+def test_window_start_steps_off_a_lone_surrogate():
+    sql = _snippet_sql([Column("S", "T", "C", "CLOB")], None, False)
+    assert "UNISTR('\\FFFD')" in sql

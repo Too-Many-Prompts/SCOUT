@@ -294,18 +294,40 @@ def _position(name: str, literal: str | None, fold: bool, start: str = "1") -> s
     return f"CASE WHEN INSTR({haystack}, :lit) > 0 THEN {regex} END"
 
 
-def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
-                 where_extra: str = "", extra_select: str = "", start: str = "1") -> str:
+def _window_start(c: str, s: str) -> str:
+    """Where the snippet's `before` piece starts: :ctx units before the hit, moved one unit right when
+    that lands inside a surrogate pair. SUBSTR on a CLOB raises ORA-22831 for an offset inside a pair
+    (positions count UTF-16 units); REGEXP_SUBSTR returns U+FFFD there instead (measured). A genuine
+    U+FFFD (one unit) also moves the start one unit right: one character less context, never an error."""
+    edge = f"GREATEST({s} - :ctx, 1)"
+    return (f"CASE WHEN TO_CHAR(REGEXP_SUBSTR({c}, '.', {edge}, 1, 'n')) = UNISTR('\\FFFD') "
+            f"THEN {edge} + 1 ELSE {edge} END")
+
+
+def _more_check(c: str, h: str, literal: str | None, fold: bool) -> str:
+    """1 when another match starts at or after `h` (the end of the hit), else 0. The substring
+    pre-check goes first: without it a value with one early hit is regex-scanned to its end
+    (measured: 0.9 s against 0.01 s on 4.9 MB). Nested CASE: Oracle does not evaluate AND in order."""
+    regex = f"CASE WHEN REGEXP_INSTR({c}, :pat, {h}, 1, 0, :flags) > 0 THEN 1 ELSE 0 END"
+    if literal is None:
+        return regex
+    haystack = f"NLS_LOWER({c}, 'NLS_SORT=BINARY')" if fold else c
+    return f"CASE WHEN INSTR({haystack}, :lit, {h}) > 0 THEN {regex} ELSE 0 END"
+
+
+def _snippet_sql(cols: list[Column], literal: str | None, fold: bool, where_extra: str = "",
+                 extra_select: str = "", start: str = "1", more: bool = True) -> str:
     """One statement that finds and cuts the first match in each column of one table.
 
     Selects the ROWID, then per column: before, hit, after, cut_before, cut_after, more (0/1),
     position, then `extra_select` (written against the aliases "SCOUT$C<i>"). Binds :pat :flags :sub
     :back :ctx (and :lit). The innermost view computes each match position once: ROWNUM keeps
     Oracle from merging it, which would evaluate the regex again wherever the position is used
-    (measured: 111 s instead of 37-48 s on a 97 MB CLOB)."""
+    (measured: 111 s instead of 37-48 s on a 97 MB CLOB). `start`: where the search begins (an SQL
+    expression); `more=False` skips the more-in-value check (always 0)."""
     owner, table = _quote(cols[0].owner), _quote(cols[0].table)
     n = range(1, len(cols) + 1)
-    c, s_, h = ({i: f'"SCOUT${k}{i}"' for i in n} for k in "CSH")
+    c, s_, h, b = ({i: f'"SCOUT${k}{i}"' for i in n} for k in "CSHB")
     inner = ", ".join(
         f"{_quote(col.column)} {c[i]}, {_position(_quote(col.column), literal, fold, start)} {s_[i]}"
         for i, col in zip(n, cols)
@@ -313,22 +335,22 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
     where = f" WHERE {where_extra}" if where_extra else ""
     v1 = f'SELECT ROWID "SCOUT$RID", {inner}, ROWNUM "SCOUT$RN1" FROM {owner}.{table}{where}'
     ends = ", ".join(
-        f"CASE WHEN {s_[i]} > 0 THEN REGEXP_INSTR({c[i]}, :pat, GREATEST({s_[i]} - :back, 1), 1, 1, :flags, :sub) END {h[i]}"
+        f"CASE WHEN {s_[i]} > 0 THEN REGEXP_INSTR({c[i]}, :pat, GREATEST({s_[i]} - :back, 1), 1, 1, :flags, :sub) END {h[i]}, "
+        f"CASE WHEN {s_[i]} > 0 THEN {_window_start(c[i], s_[i])} END {b[i]}"
         for i in n
     )
     found = " OR ".join(f"{s_[i]} > 0" for i in n)
     v2 = f'SELECT v1.*, {ends}, ROWNUM "SCOUT$RN2" FROM ({v1}) v1 WHERE {found}'
     pieces = []
     for i in n:
-        si, hi, ci = s_[i], h[i], c[i]
-        start = f"GREATEST({si} - :ctx, 1)"
+        si, hi, ci, bi = s_[i], h[i], c[i], b[i]
         pieces += [
-            f"CASE WHEN {si} > 0 THEN SUBSTR({ci}, {start}, {si} - {start}) END",
+            f"CASE WHEN {si} > 0 THEN SUBSTR({ci}, {bi}, {si} - {bi}) END",
             f"CASE WHEN {si} > 0 THEN SUBSTR({ci}, {si}, {hi} - {si}) END",
             f"CASE WHEN {si} > 0 THEN SUBSTR({ci}, {hi}, :ctx) END",
-            f"CASE WHEN {si} > :ctx + 1 THEN 1 ELSE 0 END",
+            f"CASE WHEN {si} > 0 AND {bi} > 1 THEN 1 ELSE 0 END",
             f"CASE WHEN {si} > 0 AND {hi} + :ctx <= LENGTH({ci}) THEN 1 ELSE 0 END",
-            f"CASE WHEN {si} > 0 AND REGEXP_INSTR({ci}, :pat, {hi}, 1, 0, :flags) > 0 THEN 1 ELSE 0 END",
+            f"CASE WHEN {si} > 0 THEN {_more_check(ci, hi, literal, fold)} ELSE 0 END" if more else "0",
             si,
         ]
     if extra_select:
@@ -845,7 +867,8 @@ def fetch_detail(
     pattern, flags, sub, back = snippet_regex(opts)
     column = Column(match.owner, match.table, match.column, "CLOB")  # the type is not used here
     sql = _snippet_sql([column], None, not opts.case_sensitive, where_extra="ROWID = CHARTOROWID(:rid)",
-                       extra_select='LENGTH("SCOUT$C1")', start="GREATEST(:hit_at - :back, 1)")
+                       extra_select='LENGTH("SCOUT$C1")', start="GREATEST(:hit_at - :back, 1)",
+                       more=False)  # the window never shows "more", and the check would scan the rest
     position = match.snippet.position if match.snippet is not None else None
     binds: dict[str, object] = {"pat": pattern, "flags": flags, "rid": match.rowid, "hit_at": position or 1,
                                 **_SnippetQuery(sub, back, context).binds()}
