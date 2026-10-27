@@ -268,3 +268,17 @@ def test_snippet_off_keeps_todays_sql():
     gen = _search_column(conn, Column("S", "T", "C", "CLOB"), "p", "i", MagicMock(is_set=lambda: False))
     list(gen)
     assert _executed_sql(conn) == 'SELECT ROWID, "C" FROM "S"."T" WHERE ' + _condition('"C"', None, False)
+
+
+def test_detail_skips_the_substring_precheck_and_starts_at_the_hit():
+    # one known row: the pre-check would lowercase the whole value (3.6 s on 97 MB) for nothing
+    from scout.search import Snippet, fetch_detail
+
+    conn = _conn_with_rows([])
+    conn.cursor.return_value.fetchone.return_value = None
+    m = Match("S", "T", "C", "x", "AAAR1", Snippet("", "x", "", False, False, False, 42))
+    assert fetch_detail(conn, m, SearchOptions(terms=("albert",))) is None
+    call = conn.cursor.return_value.execute.call_args
+    assert "NLS_LOWER" not in call.args[0] and ":lit" not in call.args[0]
+    assert "REGEXP_INSTR(\"C\", :pat, GREATEST(:hit_at - :back, 1), 1, 0, :flags, :sub)" in call.args[0]
+    assert call.kwargs["hit_at"] == 42 and call.kwargs["rid"] == "AAAR1"

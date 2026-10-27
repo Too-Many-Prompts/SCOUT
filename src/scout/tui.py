@@ -8,9 +8,12 @@ from textual.worker import get_current_worker
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, ProgressBar
+from textual.widgets import (
+    Button, Checkbox, DataTable, Footer, Header, Input, Label, ProgressBar, TextArea,
+)
+from textual.widgets.text_area import Selection
 
 from scout import db
 from scout import search as search_core
@@ -24,9 +27,12 @@ from scout.config import (
     parse_schemas,
 )
 from scout.control import CancelToken, Progress
+from scout.display import CUT, parts
 from scout.export import write_csv
 from scout.pattern import build_regex
-from scout.search import Column, ColumnOutcome, ColumnTimeout, Match, SearchOptions
+from scout.search import (
+    SNIPPET_CONTEXT, Column, ColumnOutcome, ColumnTimeout, Detail, Match, SearchOptions,
+)
 
 
 # One accent. Amber means "a hit"; the rest of the palette stays cool and quiet.
@@ -91,7 +97,81 @@ Checkbox { border: none; height: 1; padding: 0 1; background: transparent; }
 #empty { padding: 1 2; color: $text-muted; }
 #skipped { height: auto; max-height: 6; border: round $warning; border-title-color: $warning; }
 DataTable { background: $background; }
+
+DetailScreen { align: center middle; }
+#detail { width: 90%; height: 90%; border: round $primary; border-title-color: $primary; background: $surface; }
+#detail-title { padding: 0 1; text-style: bold; }
+#detail-note { padding: 0 1; color: $text-muted; }
+#detail-text { height: 1fr; }
+#detail-text .text-area--selection { background: $accent; color: $background; }
 """
+
+VANISHED = "This row no longer matches (it changed after the search)."
+
+
+def detail_text(d: Detail) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """The detail window's text and the hit's (row, column) start and end in it.
+
+    Line breaks are normalised to \\n first (the Gutenberg texts use \\r\\n), so the
+    locations count each break once, as the TextArea does."""
+    s = d.snippet
+    before, hit, after = (re.sub(r"\r\n?", "\n", p) for p in (s.before, s.hit, s.after))
+    before = (CUT if s.cut_before else "") + before
+    after = after + (CUT if s.cut_after else "")
+    return before + hit + after, _location(before), _location(before + hit)
+
+
+def _location(text: str) -> tuple[int, int]:
+    """The (row, column) just after `text`."""
+    return text.count("\n"), len(text) - (text.rfind("\n") + 1)
+
+
+def detail_note(d: Detail) -> str:
+    """"showing N of M characters" when the window is not the whole value, else ""."""
+    s = d.snippet
+    if not (s.cut_before or s.cut_after):
+        return ""
+    shown = len(s.before) + len(s.hit) + len(s.after)
+    return f"showing {shown:,} of {d.total_length:,} characters"
+
+
+class DetailScreen(ModalScreen[None]):
+    """A large window around one hit (DETAIL_CONTEXT characters each side), read-only and
+    scrolled to the hit, which is selected (amber). Esc closes it."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+
+    def __init__(self, ref: str) -> None:
+        super().__init__()
+        self.ref = ref
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail"):
+            yield Label(self.ref, id="detail-title")
+            yield Label("Loading...", id="detail-note")
+            yield TextArea(id="detail-text", read_only=True, soft_wrap=True)
+
+    def on_mount(self) -> None:
+        self.query_one("#detail").border_title = "Hit in context (Esc to close)"
+
+    def show_detail(self, d: Detail | None) -> None:
+        if not self.is_attached:  # closed while loading
+            return
+        note = self.query_one("#detail-note", Label)
+        if d is None:
+            note.update(VANISHED)
+            return
+        text, start, end = detail_text(d)
+        area = self.query_one("#detail-text", TextArea)
+        area.load_text(text)
+        area.selection = Selection(start, end)
+        area.scroll_cursor_visible(center=True)
+        area.focus()
+        note.update(detail_note(d))
+
+    def show_error(self, message: str) -> None:
+        if self.is_attached:
+            self.query_one("#detail-note", Label).update(message)
 
 
 class LoginScreen(Screen):
@@ -337,6 +417,7 @@ class ScoutApp(App):
                 schemas=session.schemas,
                 limit_per_column=None if every_hit else DEFAULT_LOCATE_LIMIT,
                 time_limit=None if every_hit else DEFAULT_TIME_LIMIT,
+                snippet_context=SNIPPET_CONTEXT,
             )
             build_regex(opts)
         except ValueError as exc:
@@ -509,12 +590,42 @@ class ScoutApp(App):
         self.matches.append(m)
         if len(self.matches) == 1:
             self._show_hits()
-        value = Text(" ".join(m.value.split()), no_wrap=True, overflow="ellipsis")
-        if self._highlight is not None:
-            value.highlight_regex(self._highlight, HIT_STYLE)
+        if m.snippet is None:  # a full value: mark the term with the cosmetic pattern
+            value = Text(" ".join(m.value.split()), no_wrap=True, overflow="ellipsis")
+            if self._highlight is not None:
+                value.highlight_regex(self._highlight, HIT_STYLE)
+        else:  # a snippet: Oracle says exactly which text matched
+            before, hit, after = parts(m, fold=True)
+            value = Text(before, no_wrap=True, overflow="ellipsis")
+            value.append(hit, style=HIT_STYLE)
+            value.append(after)
+            if m.snippet.more_in_value:
+                value.append(" +", style="dim")
         self.query_one("#results", DataTable).add_row(
-            Text(m.owner, style="dim"), Text(m.table, style="dim"), Text(m.column, style="bold"), value
+            Text(m.owner, style="dim"), Text(m.table, style="dim"), Text(m.column, style="bold"), value,
+            key=str(len(self.matches) - 1),
         )
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Enter on a hit opens the detail window (a large window around the hit)."""
+        if event.data_table.id != "results" or self.session is None or self.opts is None:
+            return
+        m = self.matches[int(event.cell_key.row_key.value)]
+        if m.rowid is None:
+            return
+        screen = DetailScreen(m.ref)
+        self.push_screen(screen)
+        self._detail_worker(self.session, m, self.opts, screen)
+
+    @work(thread=True, exclusive=True, group="detail")
+    def _detail_worker(self, session: db.Session, m: Match, opts: SearchOptions, screen: DetailScreen) -> None:
+        try:
+            with db.acquire(session.pool) as conn:
+                detail = search_core.fetch_detail(conn, m, opts)
+        except Exception as exc:
+            self.call_from_thread(screen.show_error, f"Error: {str(exc).splitlines()[0]}")
+            return
+        self.call_from_thread(screen.show_detail, detail)
 
     def export_csv(self) -> None:
         path = self._value("csv_path") or "scout_results.csv"

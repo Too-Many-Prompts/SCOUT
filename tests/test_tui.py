@@ -589,3 +589,140 @@ def test_highlight_pattern_follows_wildcards_and_escapes():
     pat = _highlight_pattern(SearchOptions(terms=("al*t?", r"a\*"), schemas=()))
     assert pat.search("ALBERTS").group() == "ALBERTS"
     assert pat.search("a*b").group() == "a*" and not pat.search("ab")
+
+
+# ---- snippets and the detail window
+
+def _snippet_match(more=False):
+    from scout.search import Match, Snippet
+
+    return Match("O", "T", "C", "ab zq cd", "AAAR1", Snippet("ab ", "zq", " cd", True, True, more))
+
+
+def test_detail_location_counts_crlf_as_one_line_break():
+    from scout.search import Detail, Snippet
+    from scout.tui import detail_text
+
+    d = Detail(Snippet("l1\r\nl2 ", "zq", " end", False, False, False), 17)
+    text, start, end = detail_text(d)
+    assert text == "l1\nl2 zq end" and start == (1, 3) and end == (1, 5)
+
+
+def test_detail_text_marks_cut_sides():
+    from scout.search import Detail, Snippet
+    from scout.tui import detail_text
+
+    text, start, end = detail_text(Detail(Snippet("ab ", "zq", " cd", True, True, False), 999))
+    assert text == "…ab zq cd…" and start == (0, 4) and end == (0, 6)
+
+
+def test_detail_note_only_when_cut():
+    from scout.search import Detail, Snippet
+    from scout.tui import detail_note
+
+    assert detail_note(Detail(Snippet("a", "b", "c", False, False, False), 3)) == ""
+    assert detail_note(Detail(Snippet("a", "b", "c", True, False, False), 96_828_460)) == \
+        "showing 3 of 96,828,460 characters"
+
+
+async def _search_with(monkeypatch, app, pilot, matches):
+    from scout import search as search_core
+
+    monkeypatch.setattr(search_core, "search",
+                        lambda cfg, opts, progress=None, on_skip=None, pool=None, **kw: iter(matches))
+    await login(app, pilot)
+    app.query_one("#terms").value = "zq"
+    await pilot.click("#search")
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+async def test_results_cell_shows_snippet_with_badge(monkeypatch):
+    from scout.tui import HIT_STYLE
+
+    fake_login(monkeypatch)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await _search_with(monkeypatch, app, pilot, [_snippet_match(more=True)])
+        cell = app.query_one("#results", DataTable).get_row_at(0)[3]
+        assert cell.plain == "…ab zq cd… +"
+        start = cell.plain.index("zq")
+        assert any(s.start == start and s.end == start + 2 and str(s.style) == HIT_STYLE for s in cell.spans)
+
+
+async def test_search_asks_for_snippets(monkeypatch):
+    from scout import search as search_core
+    from scout.search import SNIPPET_CONTEXT
+
+    fake_login(monkeypatch)
+    seen = []
+
+    def fake(cfg, opts, progress=None, on_skip=None, pool=None, **kw):
+        seen.append(opts)
+        return iter(())
+
+    monkeypatch.setattr(search_core, "search", fake)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await login(app, pilot)
+        app.query_one("#terms").value = "zq"
+        await pilot.click("#search")
+        await app.workers.wait_for_complete()
+    assert seen[0].snippet_context == SNIPPET_CONTEXT
+
+
+def _fake_detail(monkeypatch, result):
+    import contextlib
+
+    from scout import search as search_core
+
+    calls = []
+    monkeypatch.setattr(db, "acquire", lambda pool: contextlib.nullcontext("conn"))
+
+    def fake(conn, match, opts, **kw):
+        calls.append((conn, match, opts))
+        return result
+
+    monkeypatch.setattr(search_core, "fetch_detail", fake)
+    return calls
+
+
+async def test_enter_on_a_hit_opens_the_detail_window(monkeypatch):
+    from textual.widgets import TextArea
+
+    from scout.search import Detail, Snippet
+    from scout.tui import DetailScreen
+
+    fake_login(monkeypatch)
+    calls = _fake_detail(monkeypatch, Detail(Snippet("line one\r\nab ", "zq", " cd", True, False, False), 500))
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await _search_with(monkeypatch, app, pilot, [_snippet_match()])
+        app.query_one("#results", DataTable).focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        ta = app.screen.query_one("#detail-text", TextArea)
+        assert ta.read_only and ta.selected_text == "zq"
+        assert "showing" in str(app.screen.query_one("#detail-note").render())
+        assert calls[0][0] == "conn" and calls[0][1].rowid == "AAAR1"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, DetailScreen)
+
+
+async def test_detail_for_vanished_row_says_so(monkeypatch):
+    from scout.tui import DetailScreen
+
+    fake_login(monkeypatch)
+    _fake_detail(monkeypatch, None)
+    app = ScoutApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await _search_with(monkeypatch, app, pilot, [_snippet_match()])
+        app.query_one("#results", DataTable).focus()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        assert "no longer matches" in str(app.screen.query_one("#detail-note").render())

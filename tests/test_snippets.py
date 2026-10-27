@@ -21,6 +21,7 @@ ROWS = [
     (4, None, "😀" * 30 + "zqemoji" + "😀" * 30, None),
     (5, None, "short zqtiny", None),
     (6, None, "x" * 5_000_000 + " zqhuge", None),
+    (7, None, "zqtwo " + "y" * 100 + " zqtwo end", None),
 ]
 
 
@@ -129,6 +130,21 @@ def test_detail_of_short_value_is_whole(run, fresh_reader):
     (m,) = run("zqtiny")
     d = fetch_detail(fresh_reader, m, opts_for("zqtiny"))
     assert d.snippet.before + d.snippet.hit + d.snippet.after == "short zqtiny" and d.total_length == 12
+
+
+def test_snippet_carries_oracles_position_of_the_hit(run):
+    (m,) = run("zqsnip")
+    assert m.snippet.position == 52  # 50 a's and a space before it, counted from 1
+
+
+def test_detail_starts_at_the_hit_position_not_the_value_start(run, fresh_reader):
+    # the detail must not rescan a huge value from its start: it searches from the hit's position,
+    # so a position past the first zqtwo finds the second one
+    (m,) = run("zqtwo")
+    assert m.snippet.position == 1 and m.snippet.more_in_value
+    later = replace(m, snippet=replace(m.snippet, position=50))
+    d = fetch_detail(fresh_reader, later, opts_for("zqtwo"))
+    assert d.snippet.after == " end" and d.snippet.before.endswith("y" * 10 + " ")
 
 
 def test_detail_for_vanished_row_says_so(run, fresh_reader):

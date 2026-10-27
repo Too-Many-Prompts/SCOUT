@@ -76,6 +76,9 @@ class Snippet:
     cut_before: bool
     cut_after: bool
     more_in_value: bool  # another match starts after this one
+    # where the hit starts, in Oracle's own units (opaque here): lets fetch_detail search from
+    # the hit instead of rescanning a huge value from its start
+    position: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -281,10 +284,10 @@ def _condition(name: str, literal: str | None, fold: bool) -> str:
     return f"CASE WHEN INSTR({haystack}, :lit) > 0 THEN CASE WHEN {regex} THEN 1 END END = 1"
 
 
-def _position(name: str, literal: str | None, fold: bool) -> str:
-    """Where the first match's hit starts in a quoted column (0 or NULL = no match). The substring
-    pre-check stays in front of the regex, nested in CASE as in _condition."""
-    regex = f"REGEXP_INSTR({name}, :pat, 1, 1, 0, :flags, :sub)"
+def _position(name: str, literal: str | None, fold: bool, start: str = "1") -> str:
+    """Where the first match's hit (at or after `start`) begins in a quoted column (0 or NULL = no
+    match). The substring pre-check stays in front of the regex, nested in CASE as in _condition."""
+    regex = f"REGEXP_INSTR({name}, :pat, {start}, 1, 0, :flags, :sub)"
     if literal is None:
         return regex
     haystack = f"NLS_LOWER({name}, 'NLS_SORT=BINARY')" if fold else name
@@ -292,11 +295,11 @@ def _position(name: str, literal: str | None, fold: bool) -> str:
 
 
 def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
-                 where_extra: str = "", extra_select: str = "") -> str:
+                 where_extra: str = "", extra_select: str = "", start: str = "1") -> str:
     """One statement that finds and cuts the first match in each column of one table.
 
     Selects the ROWID, then per column: before, hit, after, cut_before, cut_after, more (0/1),
-    then `extra_select` (written against the aliases "SCOUT$C<i>"). Binds :pat :flags :sub
+    position, then `extra_select` (written against the aliases "SCOUT$C<i>"). Binds :pat :flags :sub
     :back :ctx (and :lit). The innermost view computes each match position once: ROWNUM keeps
     Oracle from merging it, which would evaluate the regex again wherever the position is used
     (measured: 111 s instead of 37-48 s on a 97 MB CLOB)."""
@@ -304,7 +307,7 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
     n = range(1, len(cols) + 1)
     c, s_, h = ({i: f'"SCOUT${k}{i}"' for i in n} for k in "CSH")
     inner = ", ".join(
-        f"{_quote(col.column)} {c[i]}, {_position(_quote(col.column), literal, fold)} {s_[i]}"
+        f"{_quote(col.column)} {c[i]}, {_position(_quote(col.column), literal, fold, start)} {s_[i]}"
         for i, col in zip(n, cols)
     )
     where = f" WHERE {where_extra}" if where_extra else ""
@@ -326,6 +329,7 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
             f"CASE WHEN {si} > :ctx + 1 THEN 1 ELSE 0 END",
             f"CASE WHEN {si} > 0 AND {hi} + :ctx <= LENGTH({ci}) THEN 1 ELSE 0 END",
             f"CASE WHEN {si} > 0 AND REGEXP_INSTR({ci}, :pat, {hi}, 1, 0, :flags) > 0 THEN 1 ELSE 0 END",
+            si,
         ]
     if extra_select:
         pieces.append(extra_select)
@@ -334,10 +338,10 @@ def _snippet_sql(cols: list[Column], literal: str | None, fold: bool,
 
 def _snippet_match(col: Column, rowid, pieces) -> Match | None:
     """The Match for one column of a snippet row (None when that column did not match)."""
-    before, hit, after, cut_before, cut_after, more = pieces
+    before, hit, after, cut_before, cut_after, more, position = pieces
     if hit is None:
         return None
-    snip = Snippet(before or "", hit, after or "", bool(cut_before), bool(cut_after), bool(more))
+    snip = Snippet(before or "", hit, after or "", bool(cut_before), bool(cut_after), bool(more), int(position))
     return Match(col.owner, col.table, col.column, snip.before + snip.hit + snip.after, str(rowid), snip)
 
 
@@ -448,7 +452,7 @@ def _search_table(
     else:
         sql = _snippet_sql(cols, literal, fold)
         binds.update(snippet.binds())
-    width = 1 if snippet is None else 6  # values per column in each row
+    width = 1 if snippet is None else 7  # values per column in each row
     counts, more, timed_out = [0] * len(cols), [False] * len(cols), False
     if stop.is_set():
         return [ColumnOutcome(c, 0, True) for c in cols]
@@ -832,18 +836,19 @@ def fetch_detail(
 ) -> Detail | None:
     """Re-read one hit's value by rowid and cut `context` characters each side of its first match.
 
-    Oracle does the cutting, so a 100 MB value never travels whole. None when the row is gone or
-    no longer matches (the data changed after the search). The owner/table/column come from the
-    match, i.e. from discovery, and are quoted; the rowid is a bind."""
+    Oracle does the cutting, so a 100 MB value never travels whole, and the regex starts at the
+    hit's position from the search (Snippet.position), so it does not rescan the value from its
+    start. No substring pre-check: for one known row it would lowercase the whole value for
+    nothing (measured: 3.6 s against 0.0 s on 97 MB). None when the row is gone or no longer
+    matches (the data changed after the search). The owner/table/column come from the match,
+    i.e. from discovery, and are quoted; the rowid is a bind."""
     pattern, flags, sub, back = snippet_regex(opts)
-    literal = required_literal(opts) if PRECHECK else None
     column = Column(match.owner, match.table, match.column, "CLOB")  # the type is not used here
-    sql = _snippet_sql([column], literal, not opts.case_sensitive,
-                       where_extra="ROWID = CHARTOROWID(:rid)", extra_select='LENGTH("SCOUT$C1")')
-    binds: dict[str, object] = {"pat": pattern, "flags": flags, "rid": match.rowid,
+    sql = _snippet_sql([column], None, not opts.case_sensitive, where_extra="ROWID = CHARTOROWID(:rid)",
+                       extra_select='LENGTH("SCOUT$C1")', start="GREATEST(:hit_at - :back, 1)")
+    position = match.snippet.position if match.snippet is not None else None
+    binds: dict[str, object] = {"pat": pattern, "flags": flags, "rid": match.rowid, "hit_at": position or 1,
                                 **_SnippetQuery(sub, back, context).binds()}
-    if literal is not None:
-        binds["lit"] = literal
     with conn.cursor() as cur:
         cur.execute(sql, **binds)
         row = cur.fetchone()
