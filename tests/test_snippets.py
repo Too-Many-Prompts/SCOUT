@@ -1,12 +1,13 @@
 """Snippets: Oracle cuts the first match with SNIPPET_CONTEXT characters each side, says whether the
 value has more matches, and returns the pieces as strings (CLOB positions count UTF-16 units)."""
 import time
+from dataclasses import replace
 
 import oracledb
 import pytest
 
 from scout import db
-from scout.search import SNIPPET_CONTEXT, SearchOptions, Snippet, search
+from scout.search import DETAIL_CONTEXT, SNIPPET_CONTEXT, SearchOptions, Snippet, fetch_detail, search
 from tests.db.expected import PHRASE_FOX_CI, REPORT_NOTES_CI, SCHEMAS
 
 SCHEMA = "SCOUT_SNIP_TINY"
@@ -114,3 +115,23 @@ def test_snippets_of_the_seed_contract_are_windows_of_its_values(reader_config, 
     assert len(got) == len(expected)
     for m in got:
         assert any(m.address == (o, t, c) and m.value in v for o, t, c, v in expected)
+
+
+def test_detail_of_huge_value_is_a_large_window(run, fresh_reader):
+    (m,) = run("zqhuge")
+    d = fetch_detail(fresh_reader, m, opts_for("zqhuge"))
+    assert d.snippet.cut_before and not d.snippet.cut_after
+    assert len(d.snippet.before) == DETAIL_CONTEXT and d.snippet.hit == "zqhuge"
+    assert d.total_length == 5_000_007
+
+
+def test_detail_of_short_value_is_whole(run, fresh_reader):
+    (m,) = run("zqtiny")
+    d = fetch_detail(fresh_reader, m, opts_for("zqtiny"))
+    assert d.snippet.before + d.snippet.hit + d.snippet.after == "short zqtiny" and d.total_length == 12
+
+
+def test_detail_for_vanished_row_says_so(run, fresh_reader):
+    (m,) = run("zqtiny")
+    (other,) = run("zqsnip")
+    assert fetch_detail(fresh_reader, replace(m, rowid=other.rowid), opts_for("zqtiny")) is None

@@ -819,6 +819,41 @@ def search(
             pool.close(force=True)
 
 
+@dataclass(frozen=True)
+class Detail:
+    """A large window around a hit (for the TUI's detail view) and the value's full length."""
+
+    snippet: Snippet
+    total_length: int  # Oracle's LENGTH of the value (UTF-16 units for a CLOB): for the "showing" note
+
+
+def fetch_detail(
+    conn: oracledb.Connection, match: Match, opts: SearchOptions, context: int = DETAIL_CONTEXT
+) -> Detail | None:
+    """Re-read one hit's value by rowid and cut `context` characters each side of its first match.
+
+    Oracle does the cutting, so a 100 MB value never travels whole. None when the row is gone or
+    no longer matches (the data changed after the search). The owner/table/column come from the
+    match, i.e. from discovery, and are quoted; the rowid is a bind."""
+    pattern, flags, sub, back = snippet_regex(opts)
+    literal = required_literal(opts) if PRECHECK else None
+    column = Column(match.owner, match.table, match.column, "CLOB")  # the type is not used here
+    sql = _snippet_sql([column], literal, not opts.case_sensitive,
+                       where_extra="ROWID = CHARTOROWID(:rid)", extra_select='LENGTH("SCOUT$C1")')
+    binds: dict[str, object] = {"pat": pattern, "flags": flags, "rid": match.rowid,
+                                **_SnippetQuery(sub, back, context).binds()}
+    if literal is not None:
+        binds["lit"] = literal
+    with conn.cursor() as cur:
+        cur.execute(sql, **binds)
+        row = cur.fetchone()
+    if row is None:
+        return None
+    rowid, *pieces, total = row
+    found = _snippet_match(column, rowid, pieces)
+    return None if found is None else Detail(found.snippet, int(total or 0))
+
+
 def fetch_row(conn: oracledb.Connection, match: Match) -> dict[str, object]:
     """Future feature: the entire row behind a match."""
     raise NotImplementedError
