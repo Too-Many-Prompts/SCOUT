@@ -3,6 +3,7 @@
 The pattern is always passed to the database as a bind variable; this module only builds
 the text. Oracle regex has no \\b, so word boundaries are spelled with POSIX classes.
 """
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,46 +15,50 @@ MAX_PATTERN_BYTES = 512  # Oracle's REGEXP_LIKE pattern limit
 MAX_DISTANCE = 255  # Oracle's interval {m,n} upper bound is 255; we use {0,near-1}
 
 _REGEX_META = set("\\^$.|?*+()[]{}")
+_ESCAPABLE = "*?\\"  # a backslash before one of these makes it a literal character
+_LIKE_WILDCARDS = set("%_")  # SQL LIKE wildcards: literal here, but not a "real" character
+
+
+def _tokens(word: str) -> Iterator[tuple[str, str]]:
+    """Split a word into ("lit", ch), ("star", "*") and ("one", "?") pieces.
+
+    `\\*`, `\\?` and `\\\\` are literals; any other backslash is a literal backslash."""
+    i = 0
+    while i < len(word):
+        ch = word[i]
+        if ch == "\\" and i + 1 < len(word) and word[i + 1] in _ESCAPABLE:
+            yield "lit", word[i + 1]
+            i += 2
+            continue
+        if ch == "*":
+            yield "star", ch
+        elif ch == "?":
+            yield "one", ch
+        else:
+            yield "lit", ch
+        i += 1
 
 
 def _core(token: str) -> str:
     """One word's pattern: regex-escaped, with * and ? as wildcards and \\ escaping them."""
     out = []
-    i = 0
-    while i < len(token):
-        ch = token[i]
-        if ch == "\\" and i + 1 < len(token) and token[i + 1] in "*?\\":
-            i += 1
-            ch = token[i]
-            out.append("\\" + ch)  # escaped wildcard or backslash: a literal
-        elif ch == "*":
+    for kind, ch in _tokens(token):
+        if kind == "star":
             out.append(f"{W}*")
-        elif ch == "?":
+        elif kind == "one":
             out.append(W)
         elif ch in _REGEX_META:
             out.append("\\" + ch)
         else:
             out.append(ch)
-        i += 1
     return "".join(out)
-
-
-_WILDCARD_CHARS = set("*?%_")
 
 
 def _has_real_character(token: str) -> bool:
     """True if the token contains something other than wildcard characters (* ? % _).
 
     An escaped wildcard (\\* or \\?) is a real, literal character."""
-    i = 0
-    while i < len(token):
-        ch = token[i]
-        if ch == "\\" and i + 1 < len(token) and token[i + 1] in "*?\\":
-            return True
-        if ch not in _WILDCARD_CHARS:
-            return True
-        i += 1
-    return False
+    return any(kind == "lit" and ch not in _LIKE_WILDCARDS for kind, ch in _tokens(token))
 
 
 _WILDCARD_ONLY = (
@@ -77,18 +82,17 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
             raise ValueError("--near takes exactly two terms")
         if not 1 <= opts.near <= MAX_DISTANCE:
             raise ValueError(f"--near distance must be 1..{MAX_DISTANCE}")
-        singles = [_single(t) for t in opts.terms]
+        singles = _words(opts)
         if not all(_has_real_character(t) for t in singles):
             raise ValueError(_WILDCARD_ONLY)
         a, b = (_core(t) for t in singles)
-        run_on = f"{W}*" if contains else ""
-        reach = f"{W}*" if contains else ""
-        gap = f"{NW}+({W}+{NW}+){{0,{opts.near - 1}}}{reach}"
+        rest_of_word = f"{W}*" if contains else ""  # default mode: a word may run on past the term
+        gap = f"{NW}+({W}+{NW}+){{0,{opts.near - 1}}}{rest_of_word}"
         pattern = (
-            f"({lead}{a}{run_on}{gap}{b}{end}|{lead}{b}{run_on}{gap}{a}{end})"
+            f"({lead}{a}{rest_of_word}{gap}{b}{end}|{lead}{b}{rest_of_word}{gap}{a}{end})"
         )
     else:
-        tokens = " ".join(opts.terms).split()
+        tokens = _words(opts)
         if not tokens:
             raise ValueError("empty search term")
         if not any(_has_real_character(t) for t in tokens):
@@ -99,6 +103,13 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
     if len(pattern.encode()) > MAX_PATTERN_BYTES:
         raise ValueError("search term is too long for Oracle's regular expression limit")
     return pattern, flags
+
+
+def _words(opts: "SearchOptions") -> list[str]:
+    """The words searched for: the two proximity terms, or every word of the phrase."""
+    if opts.near is not None:
+        return [_single(t) for t in opts.terms]
+    return " ".join(opts.terms).split()
 
 
 def _single(term: str) -> str:
@@ -115,22 +126,14 @@ def _token_parts(token: str) -> tuple[list[str], int]:
     """Split a word into its literal runs and the count of single-character `?` wildcards.
     `*` separates runs; an escaped wildcard or backslash is a literal character."""
     runs, current, fixed = [], [], 0
-    i = 0
-    while i < len(token):
-        ch = token[i]
-        if ch == "\\" and i + 1 < len(token) and token[i + 1] in "*?\\":
-            current.append(token[i + 1])
-            i += 1
-        elif ch == "*":
-            runs.append("".join(current))
-            current = []
-        elif ch == "?":
-            runs.append("".join(current))
-            current = []
-            fixed += 1
-        else:
+    for kind, ch in _tokens(token):
+        if kind == "lit":
             current.append(ch)
-        i += 1
+            continue
+        runs.append("".join(current))
+        current = []
+        if kind == "one":
+            fixed += 1
     runs.append("".join(current))
     return [r for r in runs if r], fixed
 
@@ -159,12 +162,8 @@ def _token_min_length(token: str, case_sensitive: bool) -> int:
 def min_match_length(opts: "SearchOptions") -> int:
     """Length in characters of the shortest text that could match: a column declared shorter
     than this cannot contain a match. Words are separated by at least one character."""
-    if opts.near is not None:
-        tokens = [_single(t) for t in opts.terms]
-        gaps = 1
-    else:
-        tokens = " ".join(opts.terms).split()
-        gaps = max(len(tokens) - 1, 0)
+    tokens = _words(opts)
+    gaps = 1 if opts.near is not None else max(len(tokens) - 1, 0)
     return sum(_token_min_length(t, opts.case_sensitive) for t in tokens) + gaps
 
 
@@ -199,14 +198,10 @@ def required_literal(opts: "SearchOptions") -> str | None:
 
     Case-sensitive: the longest wildcard-free run, as typed. Case-insensitive: lowercased, and
     only pieces provably safe under Oracle's case folding (see _safe_pieces)."""
-    tokens = [_single(t) for t in opts.terms] if opts.near is not None else " ".join(opts.terms).split()
     candidates: list[str] = []
-    for token in tokens:
+    for token in _words(opts):
         runs, _ = _token_parts(token)
         for run in runs:
             candidates += [run] if opts.case_sensitive else _safe_pieces(run.lower())
-    best = ""
-    for c in candidates:
-        if len(c) > len(best):
-            best = c
+    best = max(candidates, key=len, default="")  # the first of equally long candidates wins
     return best if len(best) >= MIN_LITERAL else None
