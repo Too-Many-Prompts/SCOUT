@@ -22,6 +22,6 @@ def write_csv(
     for m in rows:
         row = (m.owner, m.table, m.column, m.value)
         if incomplete is not None:
-            row += ("no" if (m.owner, m.table, m.column) in incomplete else "yes",)
+            row += ("no" if m.address in incomplete else "yes",)
         writer.writerow(row)
     return len(rows)

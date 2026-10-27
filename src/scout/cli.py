@@ -250,7 +250,7 @@ def search(
     def on_skip(col: Column, exc: Exception) -> None:
         (timed_out if isinstance(exc, ColumnTimeout) else skipped).append(col if isinstance(exc, ColumnTimeout) else (col, exc))
 
-    gen = run_search(cfg, opts, progress, on_skip, pool, on_column=lambda o: outcomes.__setitem__(_key(o.column), o), cancel=token)
+    gen = run_search(cfg, opts, progress, on_skip, pool, on_column=lambda o: outcomes.__setitem__(o.column.address, o), cancel=token)
     try:
         for m in gen:
             found.append(m)
@@ -299,46 +299,39 @@ def search(
     if timed_out:
         typer.secho(f"Timed out after {opts.time_limit:g} s (not searched to the end), so a column with "
                     "no hits listed here may still contain the term:", fg=typer.colors.YELLOW, err=True)
-        for col in sorted(timed_out, key=lambda c: (c.owner, c.table, c.column)):
-            typer.echo(f"  {_ref(col)}", err=True)
+        for col in sorted(timed_out, key=lambda c: c.address):
+            typer.echo(f"  {col.ref}", err=True)
     if skipped:
         typer.secho(f"Skipped {len(skipped)} column(s) that could not be searched:", fg=typer.colors.YELLOW, err=True)
-        for col, exc in sorted(skipped, key=lambda s: (s[0].owner, s[0].table, s[0].column)):
-            typer.echo(f"  {_ref(col)}: {str(exc).splitlines()[0]}", err=True)
+        for col, exc in sorted(skipped, key=lambda s: s[0].address):
+            typer.echo(f"  {col.ref}: {str(exc).splitlines()[0]}", err=True)
 
 
 def _hit_line(m: Match) -> str:
     """OWNER.TABLE.COLUMN<TAB>value. The colours vanish when stdout is not a terminal (click strips them),
     so a pipe or a file still gets exactly the plain tab-separated line."""
-    head, tail = _split_ref(f"{m.owner}.{m.table}.{m.column}")
+    head, tail = _split_ref(m.ref)
     return typer.style(head, dim=True) + typer.style(tail, bold=True) + "\t" + " ".join(m.value.split())
-
-
-def _key(col: Column) -> tuple[str, str, str]:
-    return (col.owner, col.table, col.column)
-
-
-def _ref(col: Column) -> str:
-    return f"{col.owner}.{col.table}.{col.column}"
 
 
 def _print_where_found(outcomes, terms, in_shell: bool, limited: bool) -> None:
     """The locate-mode summary: which columns have hits, and how to get all of them."""
-    rows = sorted((o for o in outcomes.values() if o.examples), key=lambda o: _key(o.column))
+    rows = sorted((o for o in outcomes.values() if o.examples), key=lambda o: o.column.address)
     if not rows:
         return
     typer.secho("Where it was found:", bold=True, err=True)
-    width = max(len(_ref(o.column)) for o in rows)
+    width = max(len(o.column.ref) for o in rows)
     for o in rows:
-        note = " (partial: timed out)" if o.timed_out else " (more available)" if o.more_available else ""
         what = f"{o.examples} example(s)" if limited else f"{o.examples} hit(s)"
-        head, tail = _split_ref(_ref(o.column))
-        pad = " " * (width - len(_ref(o.column)))
-        flag = typer.style(note, fg=typer.colors.YELLOW) if note else ""
+        head, tail = _split_ref(o.column.ref)
+        pad = " " * (width - len(o.column.ref))
+        flag = typer.style(f" ({o.note})", fg=typer.colors.YELLOW) if o.note else ""
         typer.echo(f"  {typer.style(head, dim=True)}{typer.style(tail, bold=True)}{pad}  {what:>15}{flag}", err=True)
         if o.more_available:
-            ref = shlex.quote(_ref(o.column))
-            hint = f"more {ref}" if in_shell else f"scout search {shlex.join(terms)} --column {_quote_ref(_ref(o.column))}"
+            if in_shell:
+                hint = f"more {shlex.quote(o.column.ref)}"
+            else:
+                hint = f"scout search {shlex.join(terms)} --column {_quote_ref(o.column.ref)}"
             typer.echo(typer.style(f"      every hit: {hint}", dim=True), err=True)
 
 
@@ -373,11 +366,11 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
         raise typer.Exit(130)
     if csv_path:
         with csv_path.open("w", newline="") as fp:
-            write_csv(found, fp, {_key(col)} if timed_out else None)
-    typer.echo(f"{len(found)} hit(s) in {_ref(col)}" + (f"; wrote {csv_path}" if csv_path else ""), err=True)
+            write_csv(found, fp, {col.address} if timed_out else None)
+    typer.echo(f"{len(found)} hit(s) in {col.ref}" + (f"; wrote {csv_path}" if csv_path else ""), err=True)
     if timed_out:
         typer.secho(f"Timed out ({timed_out}): the {len(found)} hit(s) above are partial, not every hit in "
-                    f"{_ref(col)}. Run again with a longer --time-limit or none.", fg=typer.colors.YELLOW, err=True)
+                    f"{col.ref}. Run again with a longer --time-limit or none.", fg=typer.colors.YELLOW, err=True)
     return True
 
 

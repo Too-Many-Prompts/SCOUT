@@ -425,23 +425,18 @@ class ScoutApp(App):
         if self.token is not None and not self.token.cancelled:
             self.token.cancel()
 
-    @staticmethod
-    def _ref(col: Column) -> str:
-        return f"{col.owner}.{col.table}.{col.column}"
-
     def _add_outcome(self, outcome: ColumnOutcome) -> None:
-        ref = self._ref(outcome.column)
+        ref = outcome.column.ref
         self.outcomes[ref] = outcome
-        if outcome.more_available or outcome.timed_out:
-            self.cut_off.add((outcome.column.owner, outcome.column.table, outcome.column.column))
+        if outcome.note:
+            self.cut_off.add(outcome.column.address)
         if not outcome.examples:
             return
-        note = "partial: timed out" if outcome.timed_out else "more available" if outcome.more_available else ""
         found = self.query_one("#found", DataTable)
         found.add_row(
             ref,
             Text(str(outcome.examples), justify="right"),
-            Text(note, style="#C98A2B" if outcome.timed_out else "#F2B134"),
+            Text(outcome.note, style="#C98A2B" if outcome.timed_out else "#F2B134"),
             key=ref,
         )
 
@@ -510,7 +505,7 @@ class ScoutApp(App):
         table = self.query_one("#skipped", DataTable)
         table.display = True
         reason = str(exc).splitlines()[0]
-        table.add_row(f"{col.owner}.{col.table}.{col.column}", reason)
+        table.add_row(col.ref, reason)
 
     def _add_match(self, m: Match) -> None:
         self.matches.append(m)
@@ -526,7 +521,7 @@ class ScoutApp(App):
     def export_csv(self) -> None:
         path = self._value("csv_path") or "scout_results.csv"
         if self.partial:  # cancelled or timed out: every row came from an unfinished search
-            incomplete = {(m.owner, m.table, m.column) for m in self.matches}
+            incomplete = {m.address for m in self.matches}
         else:
             incomplete = self.cut_off
         labelled = self.limited or self.partial or bool(incomplete)

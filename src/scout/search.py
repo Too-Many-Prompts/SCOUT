@@ -52,6 +52,15 @@ class Column:
     max_chars: int | None = None  # declared maximum length in characters; None for LOBs/unknown
     blocks: int | None = None  # table size in blocks (dictionary statistic; may be missing or stale)
 
+    @property
+    def address(self) -> tuple[str, str, str]:
+        return (self.owner, self.table, self.column)
+
+    @property
+    def ref(self) -> str:
+        """OWNER.TABLE.COLUMN, as shown to the user and accepted by --column / more."""
+        return f"{self.owner}.{self.table}.{self.column}"
+
 
 @dataclass(frozen=True)
 class Match:
@@ -65,6 +74,15 @@ class Match:
     def key(self) -> tuple[str, str, str, str]:
         return (self.owner, self.table, self.column, self.value)
 
+    @property
+    def address(self) -> tuple[str, str, str]:
+        """The (owner, table, column) the match was found in; compare with Column.address."""
+        return (self.owner, self.table, self.column)
+
+    @property
+    def ref(self) -> str:
+        return f"{self.owner}.{self.table}.{self.column}"
+
 
 @dataclass(frozen=True)
 class ColumnOutcome:
@@ -75,6 +93,15 @@ class ColumnOutcome:
     examples: int
     more_available: bool
     timed_out: bool = False
+
+    @property
+    def note(self) -> str:
+        """Why the hits shown may not be all of them; '' when the column is complete."""
+        if self.timed_out:
+            return "partial: timed out"
+        if self.more_available:
+            return "more available"
+        return ""
 
 
 ProgressCallback = Callable[[Progress], None]
