@@ -41,6 +41,23 @@ def _error(message: str) -> None:
     typer.secho(message, fg=typer.colors.RED, err=True)
 
 
+def _db_failed(exc: oracledb.Error) -> typer.Exit:
+    """Report a database error; returns the Exit to raise (exit status 1)."""
+    _error(f"Database error: {exc}")
+    return typer.Exit(1)
+
+
+def _cancelled(hits: int) -> typer.Exit:
+    """Report a cancel (Ctrl+C); returns the Exit to raise (exit status 130)."""
+    typer.secho(f"Cancelled; {hits} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
+    return typer.Exit(130)
+
+
+def _wipe_line() -> None:
+    """Clear the progress line on stderr, so the next output starts on a clean line."""
+    typer.echo("\r\x1b[K", nl=False, err=True)
+
+
 def _bar(fraction: float, width: int = 12) -> str:
     filled = round(max(0.0, min(1.0, fraction)) * width)
     return "▓" * filled + "░" * (width - filled)
@@ -77,8 +94,7 @@ def shell(
     try:
         session = db.open_session(cfg, schemas, threads if threads is not None else default_threads())
     except oracledb.Error as exc:
-        _error(f"Database error: {exc}")
-        raise typer.Exit(1) from exc
+        raise _db_failed(exc) from exc
     scope = ", ".join(schemas) if schemas else "every visible schema"
     typer.echo(
         typer.style("Connected", fg=typer.colors.GREEN, bold=True)
@@ -186,6 +202,8 @@ def search(
     if time_limit is not None and time_limit <= 0:
         raise typer.BadParameter("must be more than 0 seconds", param_hint="--time-limit")
     locate = not all_hits and column_ref is None
+    if time_limit is None and locate:
+        time_limit = DEFAULT_TIME_LIMIT  # --all and --column run to the end unless asked
     base = SearchOptions(
         terms=tuple(terms),
         case_sensitive=case_sensitive,
@@ -196,7 +214,7 @@ def search(
         tier=DictionaryTier.DBA if dba else DictionaryTier.ALL,
         threads=threads if threads is not None else default_threads(),
         limit_per_column=DEFAULT_LOCATE_LIMIT if locate else None,
-        time_limit=time_limit if time_limit is not None else (DEFAULT_TIME_LIMIT if locate else None),
+        time_limit=time_limit,
     )
     try:
         build_regex(base)  # reject bad terms before prompting for anything
@@ -219,8 +237,7 @@ def search(
             try:
                 session = owned = db.open_session(cfg, schemas, opts.threads)
             except oracledb.Error as exc:
-                _error(f"Database error: {exc}")
-                raise typer.Exit(1) from exc
+                raise _db_failed(exc) from exc
         try:
             if not _drill(session, opts, column_ref, csv_path):
                 raise typer.BadParameter(
@@ -249,32 +266,32 @@ def search(
             typer.echo("\r" + typer.style(line, dim=True) + "\x1b[K", nl=False, err=True)
 
     def on_skip(col: Column, exc: Exception) -> None:
-        (timed_out if isinstance(exc, ColumnTimeout) else skipped).append(col if isinstance(exc, ColumnTimeout) else (col, exc))
+        if isinstance(exc, ColumnTimeout):
+            timed_out.append(col)
+        else:
+            skipped.append((col, exc))
 
     gen = run_search(cfg, opts, progress, on_skip, pool, on_column=lambda o: outcomes.__setitem__(o.column.address, o), cancel=token)
     try:
         for m in gen:
             found.append(m)
-            if show_progress:  # wipe the unfinished progress line so the hit starts on its own line
-                typer.echo("\r\x1b[K", nl=False, err=True)
+            if show_progress:  # so the hit starts on its own line
+                _wipe_line()
             typer.echo(_hit_line(m))
     except KeyboardInterrupt:
         token.cancel()
         gen.close()
         if show_progress:
-            typer.echo("\r\x1b[K", nl=False, err=True)
-        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
-        raise typer.Exit(130) from None
+            _wipe_line()
+        raise _cancelled(len(found)) from None
     except oracledb.Error as exc:
-        _error(f"Database error: {exc}")
-        raise typer.Exit(1) from exc
+        raise _db_failed(exc) from exc
     finally:
         if show_progress:
-            typer.echo("\r\x1b[K", nl=False, err=True)
+            _wipe_line()
 
     if token.cancelled:  # the interrupt reached the database but Python never saw the signal
-        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
-        raise typer.Exit(130)
+        raise _cancelled(len(found))
 
     incomplete = {k for k, o in outcomes.items() if o.more_available or o.timed_out}
     labelled = opts.limit_per_column is not None or bool(incomplete)
@@ -291,7 +308,7 @@ def search(
         else:
             typer.echo("Try fewer words, or a * wildcard.", err=True)
     _print_where_found(outcomes, terms, in_shell=session is not None, limited=opts.limit_per_column is not None)
-    if csv_path and labelled and incomplete:
+    if csv_path and incomplete:
         typer.echo(
             f"Note: {csv_path} holds examples only for the columns marked complete=no; "
             "re-run with --all, or use --column for one column, to get every hit.",
@@ -357,14 +374,11 @@ def _drill(session: db.Session, opts: SearchOptions, ref: str, csv_path: Path | 
     except KeyboardInterrupt:
         token.cancel()
         gen.close()
-        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
-        raise typer.Exit(130) from None
+        raise _cancelled(len(found)) from None
     except oracledb.Error as exc:
-        _error(f"Database error: {exc}")
-        raise typer.Exit(1) from exc
+        raise _db_failed(exc) from exc
     if token.cancelled:  # the interrupt reached the database but Python never saw the signal
-        typer.secho(f"Cancelled; {len(found)} hit(s) found so far.", fg=typer.colors.YELLOW, err=True)
-        raise typer.Exit(130)
+        raise _cancelled(len(found))
     if csv_path:
         with csv_path.open("w", newline="") as fp:
             write_csv(found, fp, {col.address} if timed_out else None)
