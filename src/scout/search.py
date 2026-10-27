@@ -9,7 +9,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -119,12 +119,20 @@ TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})  # thick driver: call_timeo
 CANCEL_CODES = frozenset({"ORA-01013"})  # statement interrupted (our cancel(), or the user's Ctrl+C)
 PRECHECK = True  # cheap substring test before the regex; kept only if the benchmark justifies it
 SEARCHABLE_TYPES = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB")
-_DONE = object()
 
 
 class ColumnTimeout(Exception):
     """A column's query ran past SearchOptions.time_limit; reported through on_skip when the
     column had produced no hits (so 'timed out' is never mistaken for 'no hits')."""
+
+
+def _timeout_error(opts: SearchOptions) -> ColumnTimeout:
+    return ColumnTimeout(f"timed out after {opts.time_limit:g} s")
+
+
+def _deadline(opts: SearchOptions) -> float | None:
+    """time.monotonic() value at which a query started now must stop (None = no limit)."""
+    return time.monotonic() + opts.time_limit if opts.time_limit else None
 
 
 def _error_code(exc: BaseException) -> str:
@@ -148,6 +156,11 @@ class _Skipped:
     column: Column
     error: Exception
 
+
+@dataclass(frozen=True)
+class _Done:
+    future: Future
+    unit: list[Column]
 
 
 def _quote(identifier: str) -> str:
@@ -419,9 +432,9 @@ def drill_down(
         with db.acquire(pool) as conn:
             token.register(conn)
             try:
-                deadline = time.monotonic() + opts.time_limit if opts.time_limit else None
                 gen = _search_column(
-                    conn, column, pattern, flags, token, None, literal, not opts.case_sensitive, deadline
+                    conn, column, pattern, flags, token,
+                    literal=literal, fold=not opts.case_sensitive, deadline=_deadline(opts),
                 )
                 outcome = None
                 try:
@@ -436,7 +449,7 @@ def drill_down(
                 if opts.time_limit:
                     conn.call_timeout = 0
             if outcome is not None and outcome.timed_out:
-                raise ColumnTimeout(f"timed out after {opts.time_limit:g} s")
+                raise _timeout_error(opts)
     finally:
         if cancel is not None:
             cancel.unlink(token)
@@ -446,10 +459,11 @@ def _column_of(unit: list[Column], m: Match) -> Column:
     return next(c for c in unit if c.column == m.column)
 
 
-def _retry_column(conn, col: Column, args: tuple, seen: set, results: "queue.Queue", on_skip) -> None:
+def _retry_column(conn, col: Column, query: dict, seen: set, results: "queue.Queue", on_skip) -> None:
     """Search one column on its own after a combined scan failed, without repeating hits already
-    delivered. With a limit, the column still ends with at most `limit` examples in total."""
-    limit = args[3]
+    delivered. With a limit, the column still ends with at most `limit` examples in total.
+    `query` holds the keyword arguments of _search_column."""
+    limit = query["limit"]
     delivered, capped = len(seen), False
 
     def deliver(m: Match) -> None:
@@ -464,7 +478,7 @@ def _retry_column(conn, col: Column, args: tuple, seen: set, results: "queue.Que
         results.put(m)
 
     try:
-        outcome = _drain(_search_column(conn, col, *args), deliver)
+        outcome = _drain(_search_column(conn, col, **query), deliver)
     except oracledb.DatabaseError as exc:
         if _error_code(exc) in CANCEL_CODES:
             raise
@@ -558,7 +572,7 @@ def search(
             else:
                 done_w = sum(weight[k] for k in finished)
                 partial = sum(weight[k] * columns_done[k] / len(tables[k]) for k in tables if k not in finished)
-                fraction = done_w / total_weight if not partial else (done_w + partial) / total_weight
+                fraction = (done_w + partial) / total_weight
             flying = sorted(
                 ((f"{o}.{t}", now - at) for (o, t), at in started.items() if (o, t) not in finished),
                 key=lambda f: -f[1],
@@ -582,19 +596,21 @@ def search(
                 with db.acquire(pool) as conn:
                     token.register(conn)
                     try:
-                        deadline = time.monotonic() + opts.time_limit if opts.time_limit else None
-                        args = (pattern, flags, token, opts.limit_per_column, literal, not opts.case_sensitive, deadline)
+                        query = dict(
+                            pattern=pattern, flags=flags, stop=token, limit=opts.limit_per_column,
+                            literal=literal, fold=not opts.case_sensitive, deadline=_deadline(opts),
+                        )
                         if len(unit) == 1:
-                            results.put(_drain(_search_column(conn, unit[0], *args), results.put))
+                            results.put(_drain(_search_column(conn, unit[0], **query), results.put))
                         else:
+                            seen: dict[Column, set] = {}  # rowids already delivered, per column
+
+                            def deliver(m: Match) -> None:
+                                seen.setdefault(_column_of(unit, m), set()).add(m.rowid)
+                                results.put(m)
+
                             try:
-                                seen: dict[Column, set] = {}  # rowids already delivered, per column
-
-                                def deliver(m: Match, seen=seen) -> None:
-                                    seen.setdefault(_column_of(unit, m), set()).add(m.rowid)
-                                    results.put(m)
-
-                                for outcome in _drain(_search_table(conn, unit, *args), deliver):
+                                for outcome in _drain(_search_table(conn, unit, **query), deliver):
                                     results.put(outcome)
                             except oracledb.DatabaseError as exc:
                                 if token.cancelled or _error_code(exc) in CANCEL_CODES:
@@ -602,7 +618,7 @@ def search(
                                 # One bad column must not sink the others: search them one by one,
                                 # skipping hits the failed scan already delivered.
                                 for col in unit:
-                                    _retry_column(conn, col, args, seen.get(col, set()), results, on_skip)
+                                    _retry_column(conn, col, query, seen.get(col, set()), results, on_skip)
                     finally:
                         token.unregister(conn)
                         if opts.time_limit:
@@ -625,7 +641,7 @@ def search(
         units = _plan_units(tables, opts)
         total = len(units)
         for unit in units:
-            executor.submit(work, unit).add_done_callback(lambda f, unit=unit: results.put((_DONE, f, unit)))
+            executor.submit(work, unit).add_done_callback(lambda f, unit=unit: results.put(_Done(f, unit)))
 
         done = 0
         while done < total:
@@ -645,28 +661,25 @@ def search(
                 if on_column:
                     on_column(item)
                 if item.timed_out and not item.examples:
-                    timeout = ColumnTimeout(f"timed out after {opts.time_limit:g} s")
+                    timeout = _timeout_error(opts)
                     if on_skip is None:
                         raise timeout  # no way to report it, and a timeout must never look like "no hits"
                     on_skip(item.column, timeout)
             elif isinstance(item, _Skipped):
                 on_skip(item.column, item.error)
-            else:
-                _, future, unit = item
+            elif isinstance(item, _Done):
                 done += 1
-                error = future.exception()
+                error = item.future.exception()
                 if error is not None:
                     raise error
-                key = (unit[0].owner, unit[0].table)
-                columns_done[key] += len(unit)
+                key = (item.unit[0].owner, item.unit[0].table)
+                columns_done[key] += len(item.unit)
                 if columns_done[key] == len(tables[key]):
                     finished.add(key)
                 emit()
                 continue
             if time.monotonic() - last_emit >= HEARTBEAT_SECONDS:
                 emit()
-        if not columns:
-            emit()
     finally:
         token.cancel()  # interrupt anything still running on the server, stop new work
         executor.shutdown(wait=True, cancel_futures=True)
