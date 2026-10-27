@@ -72,6 +72,23 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
 
     By default a term may match inside longer words (albert finds Talbert); whole_word pins it
     to word boundaries. * and ? are always wildcards (\\* and \\? are literals)."""
+    pattern, flags, _ = _build(opts, capture=False)
+    return pattern, flags
+
+
+def snippet_regex(opts: "SearchOptions") -> tuple[str, str, int, int]:
+    """(pattern, flags, subexpression, back) for cutting a snippet with REGEXP_INSTR.
+
+    Matches exactly what build_regex matches. For a whole-word phrase the searched text is
+    captured as subexpression 2, so the hit excludes the boundary characters the pattern
+    consumes, and `back` = 1: the match itself starts up to one character before the hit.
+    Otherwise the hit is the whole match (subexpression 0, back 0)."""
+    pattern, flags, captured = _build(opts, capture=True)
+    return (pattern, flags, 2, 1) if captured else (pattern, flags, 0, 0)
+
+
+def _build(opts: "SearchOptions", capture: bool) -> tuple[str, str, bool]:
+    """The pattern, its flags, and whether the searched text is captured as group 2."""
     flags = "c" if opts.case_sensitive else "i"
     contains = not opts.whole_word
     lead = "" if contains else f"(^|{NW})"
@@ -91,6 +108,7 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
         pattern = (
             f"({lead}{a}{rest_of_word}{gap}{b}{end}|{lead}{b}{rest_of_word}{gap}{a}{end})"
         )
+        captured = False  # a proximity hit is the whole span
     else:
         tokens = _words(opts)
         if not tokens:
@@ -98,11 +116,12 @@ def build_regex(opts: "SearchOptions") -> tuple[str, str]:
         if not any(_has_real_character(t) for t in tokens):
             raise ValueError(_WILDCARD_ONLY)
         body = f"{NW}+".join(_core(t) for t in tokens)
-        pattern = f"{lead}{body}{end}"
+        captured = capture and not contains  # _core escapes ( ), so the body has no groups of its own
+        pattern = f"{lead}({body}){end}" if captured else f"{lead}{body}{end}"
 
     if len(pattern.encode()) > MAX_PATTERN_BYTES:
         raise ValueError("search term is too long for Oracle's regular expression limit")
-    return pattern, flags
+    return pattern, flags, captured
 
 
 def _words(opts: "SearchOptions") -> list[str]:

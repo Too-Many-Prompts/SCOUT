@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from scout.pattern import build_regex
+from scout.pattern import NW, build_regex, snippet_regex
 from scout.search import SearchOptions
 
 
@@ -204,3 +204,19 @@ def test_required_literal(terms, near, ci, cs):
 
     assert required_literal(SearchOptions(terms=terms, near=near)) == ci
     assert required_literal(SearchOptions(terms=terms, near=near, case_sensitive=True)) == cs
+
+
+def test_snippet_regex_captures_the_word_in_whole_word_mode():
+    pat, flags, sub, back = snippet_regex(SearchOptions(terms=("albert",), whole_word=True))
+    assert (sub, back, flags) == (2, 1, "i")
+    assert pat == f"(^|{NW})(albert)({NW}|$)"
+
+
+def test_snippet_regex_is_build_regex_otherwise():
+    for o in (SearchOptions(terms=("albert",)), SearchOptions(terms=("a", "b"), near=2, whole_word=True)):
+        assert snippet_regex(o)[:2] == build_regex(o) and snippet_regex(o)[2:] == (0, 0)
+
+
+def test_snippet_regex_refuses_what_build_regex_refuses():
+    with pytest.raises(ValueError):
+        snippet_regex(SearchOptions(terms=("**",), whole_word=True))

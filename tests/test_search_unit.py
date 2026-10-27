@@ -3,7 +3,10 @@ from unittest.mock import MagicMock
 
 from scout import db
 from scout.config import ConnectionConfig
-from scout.search import DictionaryTier, Match, SearchOptions, discover_columns, search
+from scout.search import (
+    Column, DictionaryTier, Match, SearchOptions, _condition, _search_column, _snippet_sql,
+    discover_columns, search,
+)
 
 DISCOVERY_ROWS = [  # owner, table, column, type, text_indexed, max_chars, blocks
     ("S", "T", "A", "VARCHAR2", 0, 100, 8), ("S", "T", "B", "NUMBER", 0, None, 8),
@@ -244,3 +247,24 @@ def test_nothing_is_pruned_when_the_term_has_a_single_real_character():
 
     cols = [Column("S", "T", "TINY", "CHAR", max_chars=1)]
     assert prune_columns(cols, SearchOptions(terms=("a*",))) == cols
+
+
+def test_snippet_sql_runs_the_regex_once_behind_a_rownum_view():
+    sql = _snippet_sql([Column("S", "T", "C", "CLOB")], literal="abc", fold=True)
+    assert sql.count('REGEXP_INSTR("C", :pat, 1, 1, 0, :flags, :sub)') == 1
+    assert "ROWNUM" in sql and "INSTR(NLS_LOWER(\"C\", 'NLS_SORT=BINARY'), :lit) > 0" in sql
+    assert "REGEXP_LIKE" not in sql
+
+
+def test_snippet_sql_reads_every_column_of_a_one_scan_group():
+    sql = _snippet_sql([Column("S", "T", "A", "VARCHAR2"), Column("S", "T", "B", "CLOB")], None, False)
+    assert sql.count("REGEXP_INSTR(\"A\", :pat, 1, 1, 0, :flags, :sub)") == 1
+    assert sql.count("REGEXP_INSTR(\"B\", :pat, 1, 1, 0, :flags, :sub)") == 1
+    assert 'FROM "S"."T"' in sql
+
+
+def test_snippet_off_keeps_todays_sql():
+    conn = _conn_with_rows([])
+    gen = _search_column(conn, Column("S", "T", "C", "CLOB"), "p", "i", MagicMock(is_set=lambda: False))
+    list(gen)
+    assert _executed_sql(conn) == 'SELECT ROWID, "C" FROM "S"."T" WHERE ' + _condition('"C"', None, False)
