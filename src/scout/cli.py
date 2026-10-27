@@ -20,9 +20,11 @@ from scout.config import (
     parse_schemas,
 )
 from scout.control import CancelToken, Progress
+from scout.display import text as display_text
 from scout.export import write_csv
 from scout.pattern import build_regex
 from scout.search import (
+    SNIPPET_CONTEXT,
     Column,
     ColumnOutcome,
     ColumnTimeout,
@@ -242,6 +244,7 @@ def _search_options(
         threads=threads if threads is not None else default_threads(),
         limit_per_column=DEFAULT_LOCATE_LIMIT if locate else None,
         time_limit=time_limit,
+        snippet_context=SNIPPET_CONTEXT,
     )
     try:
         build_regex(opts)
@@ -408,10 +411,14 @@ def _print_not_searched(run: _LocateRun, opts: SearchOptions) -> None:
 
 
 def _hit_line(m: Match) -> str:
-    """OWNER.TABLE.COLUMN<TAB>value. The colours vanish when stdout is not a terminal (click strips them),
-    so a pipe or a file still gets exactly the plain tab-separated line."""
+    """OWNER.TABLE.COLUMN<TAB>snippet, with … where the value was cut and " (+more)" when it has
+    further matches. The colours vanish when stdout is not a terminal (click strips them), so a
+    pipe or a file still gets exactly the plain tab-separated line."""
     head, tail = _split_ref(m.ref)
-    return typer.style(head, dim=True) + typer.style(tail, bold=True) + "\t" + " ".join(m.value.split())
+    line = typer.style(head, dim=True) + typer.style(tail, bold=True) + "\t" + display_text(m, fold=True)
+    if m.snippet is not None and m.snippet.more_in_value:
+        line += typer.style(" (+more)", dim=True)
+    return line
 
 
 def _print_where_found(outcomes, terms, in_shell: bool, limited: bool) -> None:

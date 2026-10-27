@@ -135,3 +135,16 @@ def test_detail_for_vanished_row_says_so(run, fresh_reader):
     (m,) = run("zqtiny")
     (other,) = run("zqsnip")
     assert fetch_detail(fresh_reader, replace(m, rowid=other.rowid), opts_for("zqtiny")) is None
+
+
+def test_cli_prints_the_snippet_line(snip_tiny, reader_config):
+    from typer.testing import CliRunner
+
+    from scout.cli import app
+
+    result = CliRunner().invoke(
+        app, ["search", "zqsnip", "--non-interactive", "--schema", SCHEMA],
+        env={"SCOUT_TEST_DB_USER": reader_config.user, "SCOUT_TEST_DB_PASSWORD": reader_config.password},
+    )
+    assert result.exit_code == 0, result.output
+    assert f"{SCHEMA}.T.C\t…{'a' * 19} zqsnip {'b' * 19}…\n" in result.stdout

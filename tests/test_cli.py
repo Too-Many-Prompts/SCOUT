@@ -37,7 +37,7 @@ def test_search_writes_csv(tmp_path, reader_config):
     assert result.exit_code == 0, result.output
     lines = out.read_text().splitlines()
     # locate mode labels the file: every column here fit within the limit, so all rows are complete
-    assert lines[0] == "owner,table,column,value,complete" and len(lines) == 4
+    assert lines[0] == "owner,table,column,value,more_in_value,complete" and len(lines) == 4
     assert all(line.endswith(",yes") for line in lines[1:])
     assert "SCOUT_HR.EMPLOYEES.NOTES" in result.stdout
 
@@ -385,3 +385,35 @@ def test_a_timed_out_drill_down_is_reported_as_partial_and_the_csv_says_so(monke
     assert "every hit" not in result.stdout
     assert out.read_text().splitlines() == [
         "owner,table,column,value,complete", "O,T,A,found before the clock ran out,no"]
+
+
+# ---- snippets
+
+def _snippet_hit(more):
+    from scout.search import Match, Snippet
+
+    return Match("O", "T", "C", "ab zq cd", "r", Snippet("ab ", "zq", " cd", True, True, more))
+
+
+def test_every_mode_asks_for_snippets(monkeypatch):
+    from scout.search import SNIPPET_CONTEXT
+
+    calls = _located(monkeypatch)
+    runner.invoke(app, ["search", "x", "--non-interactive"], env=ENV)
+    runner.invoke(app, ["search", "x", "--all", "--non-interactive"], env=ENV)
+    assert [c["opts"].snippet_context for c in calls] == [SNIPPET_CONTEXT, SNIPPET_CONTEXT]
+
+
+def test_hit_line_shows_the_snippet_with_cut_markers_and_more():
+    import click
+
+    from scout.cli import _hit_line
+
+    assert click.unstyle(_hit_line(_snippet_hit(more=True))) == "O.T.C\t…ab zq cd… (+more)"
+    assert click.unstyle(_hit_line(_snippet_hit(more=False))) == "O.T.C\t…ab zq cd…"
+
+
+def test_piped_stdout_carries_the_more_marker_unstyled(monkeypatch):
+    _located(monkeypatch, outcomes=[_outcome("C", 1, False)], hits=[_snippet_hit(more=True)])
+    result = runner.invoke(app, ["search", "x", "--non-interactive"], env=ENV)
+    assert "O.T.C\t…ab zq cd… (+more)\n" in result.stdout
