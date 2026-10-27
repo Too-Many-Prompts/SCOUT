@@ -1,3 +1,4 @@
+import contextlib
 import re
 from dataclasses import replace
 
@@ -23,16 +24,20 @@ from scout.config import (
 )
 from scout.control import CancelToken, Progress
 from scout.export import write_csv
+from scout.pattern import build_regex
 from scout.search import Column, ColumnOutcome, ColumnTimeout, Match, SearchOptions
 
 
 # One accent. Amber means "a hit"; the rest of the palette stays cool and quiet.
+AMBER = "#F2B134"  # signal amber: the hit
+AMBER_DIM = "#C98A2B"  # dimmer amber: partial / cut off
+
 SCOUT_THEME = Theme(
     name="scout",
-    primary="#F2B134",  # signal amber: the hit
+    primary=AMBER,
     secondary="#6FB79B",  # lichen: progress, done
-    accent="#F2B134",
-    warning="#C98A2B",  # dimmer amber: partial / cut off
+    accent=AMBER,
+    warning=AMBER_DIM,
     error="#E5645B",
     success="#6FB79B",
     foreground="#D6DED9",
@@ -42,7 +47,7 @@ SCOUT_THEME = Theme(
     dark=True,
 )
 
-HIT_STYLE = "bold #F2B134"
+HIT_STYLE = f"bold {AMBER}"
 
 SCOUT_CSS = """
 Screen { background: $background; }
@@ -102,17 +107,14 @@ class LoginScreen(Screen):
         yield Header()
         with Vertical(id="login") as box:
             box.border_title = "Log in to Oracle"
-            for label, wid, inp in (
-                ("Host", "login-host", Input(self.cfg.host, placeholder="localhost", id="login-host")),
-                ("Port", "login-port", Input(str(self.cfg.port), placeholder="1521", id="login-port")),
-                ("Service", "login-service", Input(self.cfg.service_name, placeholder="service name", id="login-service")),
-                ("User", "login-user", Input(self.cfg.user or "", placeholder="user", id="login-user")),
-                ("Password", "login-password", Input(placeholder="password", password=True, id="login-password")),
-                (
-                    "Schema(s)",
-                    "login-schema",
-                    Input(",".join(self.schemas), placeholder="comma-separated; blank = every visible schema", id="login-schema"),
-                ),
+            for label, inp in (
+                ("Host", Input(self.cfg.host, placeholder="localhost", id="login-host")),
+                ("Port", Input(str(self.cfg.port), placeholder="1521", id="login-port")),
+                ("Service", Input(self.cfg.service_name, placeholder="service name", id="login-service")),
+                ("User", Input(self.cfg.user or "", placeholder="user", id="login-user")),
+                ("Password", Input(placeholder="password", password=True, id="login-password")),
+                ("Schema(s)", Input(",".join(self.schemas), placeholder="comma-separated; blank = every visible schema",
+                                    id="login-schema")),
             ):
                 with Horizontal(classes="field"):
                     yield Label(label)
@@ -335,32 +337,34 @@ class ScoutApp(App):
                 limit_per_column=None if every_hit else DEFAULT_LOCATE_LIMIT,
                 time_limit=None if every_hit else DEFAULT_TIME_LIMIT,
             )
-            from scout.pattern import build_regex
-
             build_regex(opts)
         except ValueError as exc:
             self._status(f"Error: {exc}", "error")
             return
         self._highlight = _highlight_pattern(opts)
-        self.action_cancel_search()  # a new search replaces a running one, on the server too
-        self.matches = []
+        self._start_results(limited=opts.limit_per_column is not None)
         self.skipped = 0
         self.outcomes = {}
-        self.cut_off = set()
-        self.partial = False
         self.opts = opts
-        self.limited = opts.limit_per_column is not None
-        self.token = CancelToken()
-        self.query_one("#results", DataTable).clear()
-        found = self.query_one("#found", DataTable)
-        found.clear()
+        self.query_one("#found", DataTable).clear()
         skipped = self.query_one("#skipped", DataTable)
         skipped.clear()
         skipped.display = False
         self._show_hits("Searching...")
-        self._set_running(True)
         self._status("Searching...")
         self._search_worker(session, opts, self.token)
+
+    def _start_results(self, limited: bool) -> None:
+        """Stop whatever runs (on the server too) and empty the hits list for a new run.
+        `limited`: the run returns examples (locate mode), not every hit."""
+        self.action_cancel_search()
+        self.token = CancelToken()
+        self.matches = []
+        self.limited = limited
+        self.cut_off = set()
+        self.partial = False
+        self.query_one("#results", DataTable).clear()
+        self._set_running(True)
 
     @work(thread=True, exclusive=True, group="search")
     def _search_worker(self, session: db.Session, opts, token: CancelToken) -> None:
@@ -436,37 +440,32 @@ class ScoutApp(App):
         found.add_row(
             ref,
             Text(str(outcome.examples), justify="right"),
-            Text(outcome.note, style="#C98A2B" if outcome.timed_out else "#F2B134"),
+            Text(outcome.note, style=AMBER_DIM if outcome.timed_out else AMBER),
             key=ref,
         )
 
     def show_all_hits(self) -> None:
         """Replace the results with every hit for the column selected in the found table."""
-        found = self.query_one("#found", DataTable)
-        if self.session is None or self.opts is None or not found.row_count:
-            self._status("Select a column in the list of where it was found first.", "warn")
-            return
-        try:
-            ref = found.coordinate_to_cell_key(found.cursor_coordinate).row_key.value
-        except Exception:
-            self._status("Select a column in the list of where it was found first.", "warn")
-            return
-        outcome = self.outcomes.get(ref)
+        outcome = self._selected_outcome()
         if outcome is None:
             self._status("Select a column in the list of where it was found first.", "warn")
             return
-        self.action_cancel_search()
-        self.token = CancelToken()
-        self.matches = []
-        self.limited = False  # a single column, complete: exports without the complete column
-        self.cut_off = set()
-        self.partial = False
-        self.query_one("#results", DataTable).clear()
+        ref = outcome.column.ref
+        self._start_results(limited=False)  # a single column, complete: exports without the complete column
         self._show_hits()
-        self._set_running(True)
         self._status(f"Fetching every hit in {ref}...")
         every = replace(self.opts, limit_per_column=None, time_limit=None)
         self._drill_worker(self.session, outcome.column, every, self.token, ref)
+
+    def _selected_outcome(self) -> ColumnOutcome | None:
+        """The outcome of the row selected in the found table, if there is a usable one."""
+        found = self.query_one("#found", DataTable)
+        if self.session is None or self.opts is None or not found.row_count:
+            return None
+        ref = None
+        with contextlib.suppress(Exception):  # no row under the cursor
+            ref = found.coordinate_to_cell_key(found.cursor_coordinate).row_key.value
+        return self.outcomes.get(ref)
 
     @work(thread=True, exclusive=True, group="search")
     def _drill_worker(self, session: db.Session, column: Column, opts, token: CancelToken, ref: str) -> None:
@@ -478,8 +477,8 @@ class ScoutApp(App):
                 self.call_from_thread(self._add_match, m)
         except ColumnTimeout as exc:  # hits found are kept, but the list is not every hit
             if not worker.is_cancelled:
-                self.call_from_thread(self._drill_partial, f"Timed out ({exc}): {len(self.matches)} hit(s) in {ref} "
-                                      "so far (partial)")
+                self.call_from_thread(self._drill_end, f"Timed out ({exc}): {len(self.matches)} hit(s) in {ref} "
+                                      "so far (partial)", True)
             return
         except Exception as exc:
             if not worker.is_cancelled:
@@ -487,18 +486,16 @@ class ScoutApp(App):
             return
         if not worker.is_cancelled:
             if token.cancelled:
-                self.call_from_thread(self._drill_partial, f"Cancelled: {len(self.matches)} hit(s) in {ref} so far (partial)")
+                self.call_from_thread(self._drill_end, f"Cancelled: {len(self.matches)} hit(s) in {ref} so far (partial)", True)
             else:
-                self.call_from_thread(self._drill_done, f"All {len(self.matches)} hit(s) in {ref}")
+                self.call_from_thread(self._drill_end, f"All {len(self.matches)} hit(s) in {ref}", False)
 
-    def _drill_done(self, text: str) -> None:
+    def _drill_end(self, text: str, partial: bool) -> None:
+        """A drill-down finished; `partial` means it was cancelled or timed out."""
+        if partial:
+            self.partial = True
         self._set_running(False)
-        self._status(text, "ok")
-
-    def _drill_partial(self, text: str) -> None:
-        self.partial = True
-        self._set_running(False)
-        self._status(text, "warn")
+        self._status(text, "warn" if partial else "ok")
 
     def _add_skipped(self, col, exc) -> None:
         self.skipped += 1
@@ -562,7 +559,12 @@ def _highlight_pattern(opts: SearchOptions) -> re.Pattern | None:
                 out.append(re.escape(term[i + 1]))
                 i += 2
                 continue
-            out.append(r"\w*" if c == "*" else r"\w" if c == "?" else re.escape(c))
+            if c == "*":
+                out.append(r"\w*")
+            elif c == "?":
+                out.append(r"\w")
+            else:
+                out.append(re.escape(c))
             i += 1
         parts.append("".join(out))
     if not parts:
