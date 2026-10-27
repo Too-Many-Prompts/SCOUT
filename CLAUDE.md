@@ -225,7 +225,9 @@ These shape how the modules below are built — read this before changing code.
   search (comma-separated, blank = every visible schema) are all asked before connecting; every
   table in the named schema is searched. In the shell `search --schema` overrides it per search.
 - **Front-end conventions.** CSV with snippets writes the snippet (`…`, whitespace kept) and a `more_in_value`
-  yes/no column after `value`; without snippets the file is the old format.
+  yes/no column after `value`; without snippets the file is the old format. Every row that carries a rowid also gets a last `sql_query` column
+  (`export.row_query`): `SELECT * FROM "OWNER"."TABLE" WHERE ROWID = '...';` to paste into SQL Developer for the whole row
+  (identifier quotes and rowid quotes are doubled; hits without a rowid leave it empty).
   - *CLI:* stdout is exactly `OWNER.TABLE.COLUMN<TAB>snippet` (with `…` markers, whitespace folded, and a dim
     ` (+more)` suffix when the value has more matches); tests and scripts read it. All styling goes through
     `typer.style`/`secho` (click strips it when not a tty) or to stderr, so never decorate a stdout line. Error

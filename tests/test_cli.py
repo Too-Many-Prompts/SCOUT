@@ -1,3 +1,5 @@
+import csv
+
 import pytest
 from typer.testing import CliRunner
 
@@ -27,7 +29,7 @@ def test_proximity_needs_two_terms_before_any_prompt():
 
 
 @pytest.mark.integration
-def test_search_writes_csv(tmp_path, reader_config):
+def test_search_writes_csv(tmp_path, reader_config, reader_connection):
     out = tmp_path / "hits.csv"
     result = runner.invoke(
         app,
@@ -35,10 +37,16 @@ def test_search_writes_csv(tmp_path, reader_config):
         env={"SCOUT_TEST_DB_USER": reader_config.user, "SCOUT_TEST_DB_PASSWORD": reader_config.password},
     )
     assert result.exit_code == 0, result.output
-    lines = out.read_text().splitlines()
+    rows = list(csv.reader(out.read_text().splitlines()))
     # locate mode labels the file: every column here fit within the limit, so all rows are complete
-    assert lines[0] == "owner,table,column,value,more_in_value,complete" and len(lines) == 4
-    assert all(line.endswith(",yes") for line in lines[1:])
+    assert rows[0] == ["owner", "table", "column", "value", "more_in_value", "complete", "sql_query"] and len(rows) == 4
+    assert all(r[5] == "yes" for r in rows[1:])
+    # the pasted query pulls back exactly the row that matched
+    for r in rows[1:]:
+        assert r[6].startswith(f'SELECT * FROM "{r[0]}"."{r[1]}" WHERE ROWID = ') and r[6].endswith(";")
+        with reader_connection.cursor() as cur:
+            cur.execute(r[6].rstrip(";"))
+            assert len(cur.fetchall()) == 1
     assert "SCOUT_HR.EMPLOYEES.NOTES" in result.stdout
 
 

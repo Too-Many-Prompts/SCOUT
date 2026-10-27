@@ -38,8 +38,8 @@ def test_csv_with_snippets_adds_more_in_value_after_value():
     snip = Snippet("ab ", "zq", " cd", True, True, True)
     write_csv([Match("A", "T", "C", "ab zq cd", "r", snip)], out)
     rows = list(csv.reader(io.StringIO(out.getvalue())))
-    assert rows[0] == ["owner", "table", "column", "value", "more_in_value"]
-    assert rows[1][3:] == ["…ab zq cd…", "yes"]
+    assert rows[0] == ["owner", "table", "column", "value", "more_in_value", "sql_query"]
+    assert rows[1][3:5] == ["…ab zq cd…", "yes"]
 
 
 def test_csv_with_snippets_and_complete_column():
@@ -47,4 +47,21 @@ def test_csv_with_snippets_and_complete_column():
     snip = Snippet("", "zq", "", False, False, False)
     write_csv([Match("A", "T", "C", "zq", "r", snip)], out, incomplete={("A", "T", "C")})
     assert out.getvalue().splitlines() == [
-        "owner,table,column,value,more_in_value,complete", "A,T,C,zq,no,no"]
+        "owner,table,column,value,more_in_value,complete,sql_query",
+        'A,T,C,zq,no,no,"SELECT * FROM ""A"".""T"" WHERE ROWID = \'r\';"']
+
+
+def test_csv_sql_query_column_pulls_back_the_whole_row():
+    out = io.StringIO()
+    write_csv([Match("A", "T", "C", "v1", "AAAB+/09")], out)
+    rows = list(csv.reader(io.StringIO(out.getvalue())))
+    assert rows[0] == ["owner", "table", "column", "value", "sql_query"]
+    assert rows[1][4] == """SELECT * FROM "A"."T" WHERE ROWID = 'AAAB+/09';"""
+
+
+def test_csv_sql_query_escapes_quotes_and_blanks_missing_rowids():
+    out = io.StringIO()
+    write_csv([Match('O"X', "T", "C", "v1", "a'b"), Match("P", "T", "C", "v2")], out)
+    rows = list(csv.reader(io.StringIO(out.getvalue())))
+    assert rows[1][4] == """SELECT * FROM "O""X"."T" WHERE ROWID = 'a''b';"""
+    assert rows[2][4] == ""
