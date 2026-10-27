@@ -14,7 +14,7 @@ command and the TUI search/export (styled, themed front ends), locate mode with 
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`). Not implemented yet: `search.fetch_row` (fetch the whole row
 behind a match; `Match.rowid` is already captured for it) and any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 617 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 1 `bench` test run separately (`pytest -m bench`, needs the generated dataset). The Docker compose path (`scripts/db.sh`,
+Status: 644 tests pass with the database up (integration tests run once per scan mode), 2 strict-xfail (`fetch_row`, once per mode), plus 7 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 3.5 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -125,6 +125,11 @@ scout search albert --all --csv hits.csv            # every hit everywhere (defa
 # benchmark (separate schema SCOUT_BENCH; the load takes about 7 minutes)
 python -m tests.bench.load --tables 20 --rows 50000
 python -m tests.bench.run --threads 8 --limit 5 [--precheck on|off] [--single-scan on|off]
+# large-CLOB dataset (schema SCOUT_CLOB: Simple English + 20k Japanese Wikipedia articles from Hugging Face,
+# four Gutenberg books and a 100 MB CLOB; about 780 MB of downloads cached in $SCOUT_DATA_CACHE, default
+# ~/.cache/scout, sha256-pinned; the load takes about 3 minutes; needs pip install -e ".[bench]" for pyarrow)
+python -m tests.bench.clobs [--rows N] [--ja-rows N] [--no-ja] [--huge-copies N]
+python -m tests.bench.run --schema SCOUT_CLOB --limit 5
 pytest -m bench
 
 # run the TUI (login screen first; Ctrl+L logs out back to it)
@@ -238,7 +243,7 @@ tests/
   conftest.py        # env-driven fixtures: admin_config, reader_config, *_connection (skip if no DB)
   db/seed.sql        # synthetic multi-schema fixture; db/expected.py is its ground truth
   db/load_seed.py    # loads the seed without docker exec
-  bench/             # generated large dataset + timing runner (marker: bench, excluded by default)
+  bench/             # generated large datasets (load.py, clobs.py) + timing runner (marker: bench, excluded by default)
   test_*.py          # unit (mocked) + integration (@pytest.mark.integration) + cli/tui
 docker-compose.yml   # test Oracle (gvenzl/oracle-free:latest)
 scripts/db.sh        # up|down|reset|logs

@@ -1,8 +1,9 @@
 """Time searches over the SCOUT_BENCH schema and print a comparison.
 
-Usage: python -m tests.bench.run [--threads 8] [--limit 5]
+Usage: python -m tests.bench.run [--threads 8] [--limit 5] [--schema SCOUT_CLOB]
 Variants: 'absent' (full scan, no hits), 'needle' (rare hits in one column), 'common' (a
 word that appears in every table). Each runs unlimited and, with --limit, in locate mode.
+With --schema SCOUT_CLOB (python -m tests.bench.clobs) the needle is the last word of a 100 MB CLOB.
 """
 import argparse
 import os
@@ -13,7 +14,10 @@ from dotenv import load_dotenv
 
 from scout.config import ConnectionConfig
 from scout.search import SearchOptions, search
+from tests.bench import clobs
 from tests.bench.load import ABSENT, NEEDLE, SCHEMA
+
+NEEDLES = {SCHEMA: NEEDLE, clobs.SCHEMA: clobs.TAIL}
 
 
 def measure(cfg: ConnectionConfig, variants: dict[str, SearchOptions]) -> list[tuple[str, float, int]]:
@@ -26,11 +30,11 @@ def measure(cfg: ConnectionConfig, variants: dict[str, SearchOptions]) -> list[t
     return out
 
 
-def default_variants(threads: int, limit: int | None) -> dict[str, SearchOptions]:
-    base = SearchOptions(terms=(ABSENT,), schemas=(SCHEMA,), threads=threads)
+def default_variants(threads: int, limit: int | None, schema: str = SCHEMA) -> dict[str, SearchOptions]:
+    base = SearchOptions(terms=(ABSENT,), schemas=(schema,), threads=threads)
     variants = {
         "absent": base,
-        "needle": replace(base, terms=(NEEDLE,)),
+        "needle": replace(base, terms=(NEEDLES[schema],)),
         "common": replace(base, terms=("the",)),
     }
     if limit is not None:
@@ -48,6 +52,7 @@ def main() -> None:
                     help="force the substring pre-check on or off (default: the library setting)")
     ap.add_argument("--single-scan", choices=("on", "off"), default=None,
                     help="force one scan per table on or off (default: the library setting)")
+    ap.add_argument("--schema", choices=sorted(NEEDLES), default=SCHEMA, help="dataset to search")
     args = ap.parse_args()
     if args.single_scan:
         import scout.search
@@ -65,7 +70,7 @@ def main() -> None:
         password=os.environ["SCOUT_TEST_READER_PASSWORD"],
     )
     print(f"{'variant':<24}{'seconds':>10}{'matches':>10}")
-    for name, secs, n in measure(cfg, default_variants(args.threads, args.limit)):
+    for name, secs, n in measure(cfg, default_variants(args.threads, args.limit, args.schema)):
         print(f"{name:<24}{secs:>10.2f}{n:>10}")
 
 

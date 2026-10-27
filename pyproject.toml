@@ -20,6 +20,9 @@ dev = [
     "python-dotenv",
     "textual-dev",
 ]
+bench = [
+    "pyarrow",  # reads the Hugging Face Wikipedia parquet files (tests/bench/clobs.py)
+]
 
 [project.scripts]
 scout = "scout.cli:app"
@@ -33,5 +36,5 @@ asyncio_mode = "auto"
 addopts = "-m 'not bench'"  # slow benchmark-sized tests run only with: pytest -m bench
 markers = [
     "integration: requires a live Oracle database (see tests/conftest.py)",
-    "bench: slow, needs the generated SCOUT_BENCH dataset (python -m tests.bench.load)",
+    "bench: slow, needs a generated dataset (SCOUT_BENCH: tests.bench.load; SCOUT_CLOB: tests.bench.clobs)",
 ]
