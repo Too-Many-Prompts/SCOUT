@@ -1,7 +1,8 @@
+import csv
 import io
 
 from scout.export import write_csv
-from scout.search import Match
+from scout.search import Match, Snippet
 
 def test_csv_header_and_rows_sorted():
     out = io.StringIO()
@@ -30,3 +31,20 @@ def test_csv_without_incomplete_keeps_the_four_column_format():
     out = io.StringIO()
     write_csv([Match("A", "T", "C", "v1")], out)
     assert out.getvalue().splitlines()[0] == "owner,table,column,value"
+
+
+def test_csv_with_snippets_adds_more_in_value_after_value():
+    out = io.StringIO()
+    snip = Snippet("ab ", "zq", " cd", True, True, True)
+    write_csv([Match("A", "T", "C", "ab zq cd", "r", snip)], out)
+    rows = list(csv.reader(io.StringIO(out.getvalue())))
+    assert rows[0] == ["owner", "table", "column", "value", "more_in_value"]
+    assert rows[1][3:] == ["…ab zq cd…", "yes"]
+
+
+def test_csv_with_snippets_and_complete_column():
+    out = io.StringIO()
+    snip = Snippet("", "zq", "", False, False, False)
+    write_csv([Match("A", "T", "C", "zq", "r", snip)], out, incomplete={("A", "T", "C")})
+    assert out.getvalue().splitlines() == [
+        "owner,table,column,value,more_in_value,complete", "A,T,C,zq,no,no"]
