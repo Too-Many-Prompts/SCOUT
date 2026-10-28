@@ -67,3 +67,7 @@ def test_bad_number_in_defaults_file_names_the_setting(in_tmp):
     (in_tmp / "defaults.txt").write_text("port = abc\n")
     with pytest.raises(ValueError, match="defaults.txt .port."):
         load_defaults()
+
+
+def test_password_is_not_in_repr():
+    assert "secret" not in repr(ConnectionConfig(user="u", password="secret"))

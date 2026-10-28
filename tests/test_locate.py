@@ -288,7 +288,7 @@ def test_a_phrase_gives_the_same_matches_either_way(reader_config, monkeypatch, 
 
 def test_single_scan_reports_a_broken_table_once_per_column(reader_config, single_scan):
     skipped = []
-    opts = SearchOptions(terms=("x",), schemas=("SCOUT_BROKEN",), threads=2)
+    opts = SearchOptions(terms=("x",), schemas=("SCOUT_BROKEN",), threads=2, include_external=True)
     list(search(reader_config, opts, on_skip=lambda c, e: skipped.append(col_key(c))))
     assert skipped == [ex.BROKEN]
 

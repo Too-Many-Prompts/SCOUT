@@ -12,6 +12,8 @@ if TYPE_CHECKING:
 W = "[[:alnum:]_]"  # a word character
 NW = "[^[:alnum:]_]"  # a non-word character
 MAX_PATTERN_BYTES = 512  # Oracle's REGEXP_LIKE pattern limit
+MAX_STARS = 3  # `*` wildcards per search: each is an open-ended repeat, and several in a row make
+#                Oracle's backtracking regex engine burn CPU on long values (a*a*a*a*b)
 MAX_DISTANCE = 255  # Oracle's interval {m,n} upper bound is 255; we use {0,near-1}
 
 _REGEX_META = set("\\^$.|?*+()[]{}")
@@ -61,6 +63,15 @@ def _has_real_character(token: str) -> bool:
     return any(kind == "lit" and ch not in _LIKE_WILDCARDS for kind, ch in _tokens(token))
 
 
+def _check_stars(words: list[str]) -> None:
+    stars = sum(kind == "star" for word in words for kind, _ in _tokens(word))
+    if stars > MAX_STARS:
+        raise ValueError(
+            f"Too many * wildcards ({stars}); use at most {MAX_STARS}. Many wildcards can make the "
+            "database spend a very long time on one value."
+        )
+
+
 _WILDCARD_ONLY = (
     "Searching for only wildcard characters (like * or ?) would match everything; "
     "include at least one letter or digit."
@@ -102,6 +113,7 @@ def _build(opts: "SearchOptions", capture: bool) -> tuple[str, str, bool]:
         singles = _words(opts)
         if not all(_has_real_character(t) for t in singles):
             raise ValueError(_WILDCARD_ONLY)
+        _check_stars(singles)
         a, b = (_core(t) for t in singles)
         rest_of_word = f"{W}*" if contains else ""  # default mode: a word may run on past the term
         gap = f"{NW}+({W}+{NW}+){{0,{opts.near - 1}}}{rest_of_word}"
@@ -118,6 +130,7 @@ def _build(opts: "SearchOptions", capture: bool) -> tuple[str, str, bool]:
             raise ValueError("empty search term")
         if not any(_has_real_character(t) for t in tokens):
             raise ValueError(_WILDCARD_ONLY)
+        _check_stars(tokens)
         body = f"{NW}+".join(_core(t) for t in tokens)
         captured = capture and not contains  # _core escapes ( ), so the body has no groups of its own
         pattern = f"{lead}({body}){end}" if captured else f"{lead}{body}{end}"

@@ -189,6 +189,10 @@ def search(
     ] = None,
     table: Annotated[list[str] | None, typer.Option("--table", "-t")] = None,
     dba: Annotated[bool, typer.Option("--dba", help="Use DBA_* views instead of ALL_*.")] = False,
+    include_external: Annotated[
+        bool,
+        typer.Option("--include-external", help="Also search external tables (skipped by default: they read files on the database server)."),
+    ] = False,
     host: Annotated[str | None, typer.Option("--host")] = None,
     port: Annotated[int | None, typer.Option("--port")] = None,
     service: Annotated[str | None, typer.Option("--service", help="Service name.")] = None,
@@ -201,6 +205,7 @@ def search(
     opts = _search_options(
         terms=terms, whole_word=whole_word, near=near, case_sensitive=case_sensitive, all_hits=all_hits,
         column_ref=column_ref, time_limit=time_limit, threads=threads, table=table, dba=dba,
+        include_external=include_external,
     )
     session = ctx.obj if isinstance(ctx.obj, db.Session) else None  # set by the shell: already logged in
     cfg, opts = _scope(
@@ -225,6 +230,7 @@ def _search_options(
     threads: int | None,
     table: list[str] | None,
     dba: bool,
+    include_external: bool = False,
 ) -> SearchOptions:
     """The search's options from the command line (schemas are filled in later, by _scope).
 
@@ -246,6 +252,7 @@ def _search_options(
         time_limit=time_limit,
         snippet_context=SNIPPET_CONTEXT,
         every_occurrence=not locate,
+        include_external=include_external,
     )
     try:
         build_regex(opts)

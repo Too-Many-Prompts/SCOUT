@@ -73,7 +73,7 @@ def test_bad_credentials_exit_cleanly_without_traceback():
 @pytest.mark.integration
 def test_unsearchable_table_is_skipped_and_reported_at_the_end(reader_config):
     result = runner.invoke(
-        app, ["search", "report"],
+        app, ["search", "report", "--include-external"],
         input=f"{reader_config.user}\n{reader_config.password}\n{reader_config.service_name}\nSCOUT_HR,SCOUT_BROKEN\n",
     )
     assert result.exit_code == 0, result.output  # carried on despite the broken table

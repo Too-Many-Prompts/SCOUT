@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -46,6 +47,9 @@ class SearchOptions:
     # list every occurrence of a match in a value as its own hit, not just the first (needs
     # snippet_context; for the "all hits" modes, with no limit_per_column)
     every_occurrence: bool = False
+    # external tables read files on the database server (and may run a PREPROCESSOR program), so
+    # they are skipped unless asked for
+    include_external: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,10 +146,12 @@ MAX_COLUMNS_PER_SCAN = 20  # one scan covers at most this many columns: short SQ
 HEARTBEAT_SECONDS = 1.0  # progress is re-sent at least this often while a search is running
 TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})  # thick driver: call_timeout exceeded
 CANCEL_CODES = frozenset({"ORA-01013"})  # statement interrupted (our cancel(), or the user's Ctrl+C)
+MIN_ORACLE_VERSION = 19  # oldest release the dictionary queries are written for
 PRECHECK = True  # cheap substring test before the regex; kept only if the benchmark justifies it
 SEARCHABLE_TYPES = ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB")
 SNIPPET_CONTEXT = 20  # characters each side of the hit in the CLI, the TUI table and the CSV
 DETAIL_CONTEXT = 100_000  # characters each side of the hit in the TUI's detail window
+DETAIL_TIMEOUT = 60.0  # seconds fetch_detail / fetch_row may take: one known row should be quick
 ROW_CELL_CHARS = 1_000  # characters of one value in the TUI's whole-row view (Oracle's SUBSTR returns at most 4,000 bytes)
 
 
@@ -222,13 +228,17 @@ def _quote(identifier: str) -> str:
 def discover_columns(conn: oracledb.Connection, opts: SearchOptions) -> list[Column]:
     """Searchable (string-typed) columns of tables, from the data dictionary tier in opts.
 
-    Views, domain-index internal tables, nested-table storage and IOT overflow segments are
-    excluded, as are Oracle-maintained schemas (SYS, SYSTEM, ...). Schema and
+    Views, external tables (unless opts.include_external), domain-index internal tables,
+    nested-table storage and IOT overflow segments are excluded, as are Oracle-maintained
+    schemas (SYS, SYSTEM, ...). Schema and
     table filters match case-insensitively.
     """
     t = opts.tier.value  # fixed enum value, never user text: ALL or DBA
     binds: dict[str, str] = {}
     filters = []
+    if not opts.include_external:
+        filters.append(f"""AND NOT EXISTS (SELECT 1 FROM {t}_EXTERNAL_TABLES et
+                              WHERE et.owner = c.owner AND et.table_name = c.table_name)""")
     for name, col, values in (("s", "c.owner", opts.schemas), ("t", "c.table_name", opts.tables)):
         if values:
             keys = []
@@ -259,9 +269,14 @@ def discover_columns(conn: oracledb.Connection, opts: SearchOptions) -> list[Col
            AND c.owner NOT IN (SELECT username FROM {t}_USERS WHERE oracle_maintained = 'Y')
            {' '.join(filters)}
          ORDER BY c.owner, c.table_name, c.column_id"""
-    with conn.cursor() as cur:
-        cur.execute(sql, binds)
-        rows = cur.fetchall()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, binds)
+            rows = cur.fetchall()
+    except oracledb.DatabaseError as exc:
+        if _error_code(exc) == "ORA-00904":  # a dictionary column we rely on is missing
+            raise oracledb.DatabaseError(f"SCOUT needs Oracle Database {MIN_ORACLE_VERSION} or later: {exc}") from exc
+        raise
     return [
         Column(owner, table, column, dtype, bool(indexed), max_chars, blocks)
         for owner, table, column, dtype, indexed, max_chars, blocks in rows
@@ -676,7 +691,7 @@ def drill_down(
             finally:
                 token.unregister(conn)
                 if opts.time_limit:
-                    conn.call_timeout = 0
+                    db.reset_call_timeout(conn)
             if outcome is not None and outcome.timed_out:
                 raise _timeout_error(opts)
     finally:
@@ -828,6 +843,7 @@ def search(
             results.put(_Started(unit[0].owner, unit[0].table, time.monotonic()))
             try:
                 with db.acquire(pool) as conn:
+                    db.set_action(conn, f"{unit[0].owner}.{unit[0].table}")  # visible to the DBA
                     token.register(conn)
                     try:
                         query = dict(
@@ -857,7 +873,7 @@ def search(
                     finally:
                         token.unregister(conn)
                         if opts.time_limit:
-                            conn.call_timeout = 0  # the connection goes back to the pool
+                            db.reset_call_timeout(conn)  # the connection goes back to the pool
             except oracledb.DatabaseError as exc:
                 if token.cancelled:  # interrupted by cancel(): not an error
                     return
@@ -934,6 +950,20 @@ def search(
             pool.close(force=True)
 
 
+@contextmanager
+def _bounded(conn: oracledb.Connection, seconds: float = DETAIL_TIMEOUT) -> Iterator[None]:
+    """Cap every round trip of a one-row lookup; a timeout becomes a ColumnTimeout with a plain message."""
+    conn.call_timeout = int(seconds * 1000)
+    try:
+        yield
+    except oracledb.DatabaseError as exc:
+        if _error_code(exc) in TIMEOUT_CODES:
+            raise ColumnTimeout(f"timed out after {seconds:g} s") from exc
+        raise
+    finally:
+        db.reset_call_timeout(conn)
+
+
 @dataclass(frozen=True)
 class Detail:
     """A large window around a hit (for the TUI's detail view) and the value's full length."""
@@ -961,7 +991,7 @@ def fetch_detail(
     position = match.snippet.position if match.snippet is not None else None
     binds: dict[str, object] = {"pat": pattern, "flags": flags, "rid": match.rowid, "hit_at": position or 1,
                                 **_SnippetQuery(sub, back, context).binds()}
-    with conn.cursor() as cur:
+    with _bounded(conn), conn.cursor() as cur:
         cur.execute(sql, **binds)
         row = cur.fetchone()
     if row is None:
@@ -997,7 +1027,7 @@ def fetch_row(conn: oracledb.Connection, match: Match, cell_chars: int = ROW_CEL
     names come from the dictionary and are quoted; the rowid is a bind."""
     if match.rowid is None:
         raise ValueError("the match carries no rowid")
-    with conn.cursor() as cur:
+    with _bounded(conn), conn.cursor() as cur:
         cur.execute(
             """SELECT column_name, data_type FROM all_tab_columns
                 WHERE owner = :o AND table_name = :t ORDER BY column_id""",

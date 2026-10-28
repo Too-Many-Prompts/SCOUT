@@ -134,7 +134,7 @@ def test_search_only_issues_read_only_sql(monkeypatch):
     assert statements
     for sql in statements:
         head = sql.strip().upper()
-        assert head.startswith(("SELECT", "WITH", "SET TRANSACTION READ ONLY")), sql
+        assert head.startswith(("SELECT", "WITH", "SET TRANSACTION READ ONLY", "ALTER SESSION DISABLE PARALLEL QUERY")), sql
     assert any("REGEXP_LIKE" in s for s in statements)
 
 
@@ -321,3 +321,97 @@ def test_every_occurrence_walks_the_value_by_rowid_without_a_precheck():
     assert "NLS_LOWER" not in follow.args[0] and ":lit" not in follow.args[0]
     assert follow.kwargs["from_at"] == 3 and follow.kwargs["rid"] == "R1"
     assert cur.execute.call_args_list[2].kwargs["from_at"] == 7
+
+
+def test_external_tables_are_skipped_unless_asked_for():
+    conn = _conn_with_rows([])
+    discover_columns(conn, SearchOptions(terms=("x",)))
+    assert "ALL_EXTERNAL_TABLES" in _executed_sql(conn).upper()
+    conn = _conn_with_rows([])
+    discover_columns(conn, SearchOptions(terms=("x",), include_external=True))
+    assert "EXTERNAL_TABLES" not in _executed_sql(conn).upper()
+    conn = _conn_with_rows([])
+    discover_columns(conn, SearchOptions(terms=("x",), tier=DictionaryTier.DBA))
+    assert "DBA_EXTERNAL_TABLES" in _executed_sql(conn).upper()
+
+
+def test_missing_dictionary_column_says_oracle_19_is_needed():
+    import oracledb
+    import pytest
+
+    conn = _conn_with_rows([])
+    conn.cursor.return_value.execute.side_effect = oracledb.DatabaseError("ORA-00904: invalid identifier")
+    with pytest.raises(oracledb.DatabaseError, match="Oracle Database 19 or later"):
+        discover_columns(conn, SearchOptions(terms=("x",)))
+
+
+def _session_conn():
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def test_every_session_is_read_only_without_parallel_query_and_tagged():
+    conn, cur = _session_conn()
+    pool = MagicMock()
+    pool.acquire.return_value = conn
+    with db.acquire(pool):
+        assert conn.module == "SCOUT"
+        assert [c.args[0] for c in cur.execute.call_args_list] == [
+            "SET TRANSACTION READ ONLY", "ALTER SESSION DISABLE PARALLEL QUERY"]
+        db.set_action(conn, "S.T")
+        assert conn.action == "S.T"
+    assert conn.action == "idle"
+    pool.release.assert_called_once_with(conn)
+
+
+def test_action_is_cut_to_oracles_limit():
+    conn, _ = _session_conn()
+    db.set_action(conn, "É" * 100)
+    assert len(conn.action.encode()) <= 64
+
+
+def test_a_connection_that_died_on_a_timeout_is_still_released():
+    import oracledb
+
+    conn, _ = _session_conn()
+    conn.rollback.side_effect = oracledb.InterfaceError("DPY-1001: not connected")
+    pool = MagicMock()
+    pool.acquire.return_value = conn
+    with db.acquire(pool):
+        pass
+    pool.release.assert_called_once_with(conn)
+
+
+def test_reset_call_timeout_survives_a_dead_connection():
+    import oracledb
+
+    class Dead:
+        @property
+        def call_timeout(self):
+            return 0
+
+        @call_timeout.setter
+        def call_timeout(self, value):
+            raise oracledb.InterfaceError("DPY-1001: not connected")
+
+    db.reset_call_timeout(Dead())  # must not raise
+
+
+def test_row_lookups_are_bounded_and_a_timeout_is_explained():
+    import oracledb
+    import pytest
+
+    from scout.search import ColumnTimeout, fetch_detail
+
+    conn, cur = _session_conn()
+    cur.execute.side_effect = oracledb.DatabaseError("DPY-4024: call timeout of 60000 ms exceeded")
+    from scout.search import Snippet
+    m = Match("S", "T", "C", "v", rowid="AAA", snippet=Snippet("", "v", "", False, False, False, 1, 2))
+    seen = []
+    type(conn).call_timeout = property(lambda self: 0, lambda self, v: seen.append(v))
+    with pytest.raises(ColumnTimeout, match="60"):
+        fetch_detail(conn, m, SearchOptions(terms=("v",)))
+    assert seen == [60000, 0]  # armed, then cleared for the pool

@@ -211,7 +211,8 @@ def test_fetch_row_returns_the_whole_row(reader_config, reader_connection):
 
 def test_broken_table_is_skipped_with_on_skip_and_search_continues(reader_config):
     skipped = []
-    opts = SearchOptions(terms=("report",), whole_word=True, schemas=("SCOUT_HR", "SCOUT_BROKEN"), threads=4)
+    opts = SearchOptions(terms=("report",), whole_word=True, schemas=("SCOUT_HR", "SCOUT_BROKEN"), threads=4,
+                         include_external=True)
     got = {m.key for m in search(reader_config, opts, on_skip=lambda c, e: skipped.append((c, e)))}
     assert got == ex.REPORT_NOTES_CI
     assert [(c.owner, c.table, c.column) for c, _ in skipped] == [ex.BROKEN]
@@ -221,7 +222,7 @@ def test_broken_table_is_skipped_with_on_skip_and_search_continues(reader_config
 def test_broken_table_raises_without_on_skip(reader_config):
     import oracledb
 
-    opts = SearchOptions(terms=("report",), schemas=("SCOUT_BROKEN",), threads=2)
+    opts = SearchOptions(terms=("report",), schemas=("SCOUT_BROKEN",), threads=2, include_external=True)
     with pytest.raises(oracledb.DatabaseError, match="ORA-"):
         list(search(reader_config, opts))
 

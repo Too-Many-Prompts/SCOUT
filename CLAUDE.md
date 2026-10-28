@@ -15,7 +15,7 @@ snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-sn
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`), and the TUI whole-row sheet (`search.fetch_row`
 by rowid; TUI only, see "Front-end conventions"). Not implemented yet: any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 736 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 736 tests passed with the database up before the production-safety changes (they add about 15 more; run `pytest -m integration` to confirm) (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -35,6 +35,17 @@ Status: 736 tests pass with the database up (integration tests run once per scan
 - **Scope:** only string columns (CHAR/NCHAR/VARCHAR2/NVARCHAR2/CLOB/NCLOB) of real tables.
   Views, Oracle Text `DR$` tables, nested-table storage, IOT overflow segments and
   Oracle-maintained schemas are excluded. Patterns are limited to Oracle's 512-byte regex limit.
+- **At most 3 `*` per search** (`pattern.MAX_STARS`, counted across all words; `\*` does not count): each `*` is an
+  open-ended repeat and several make Oracle's backtracking regex burn CPU on long values. Refused by `build_regex`.
+- **Production safety of the session itself:** every session sets `module = "SCOUT"` (and `action` = the table being
+  scanned) so a DBA can find it in `V$SESSION`, and runs `ALTER SESSION DISABLE PARALLEL QUERY` (a table declared
+  PARALLEL must not fan a scan out into PX servers). **External tables are skipped** (they read files on the DB
+  server, possibly running a PREPROCESSOR) unless `SearchOptions.include_external` / CLI `--include-external`.
+  **Oracle 19 or later** is the supported floor (an ORA-00904 from discovery says so). `fetch_detail` / `fetch_row`
+  run with a 60 s `call_timeout` (`DETAIL_TIMEOUT`); resetting `call_timeout` on a connection that died on a
+  timeout is suppressed (`db.reset_call_timeout`) so it cannot replace the timeout being reported.
+  `ConnectionConfig.password` is excluded from `repr`. A long READ ONLY snapshot can end in ORA-01555 on a busy
+  database; the column then shows up in the skipped list.
 - **A search must contain a real character.** A term (or phrase, or either proximity term) made only
   of `* ? % _` is refused with a plain message by `pattern.build_regex`, so the core, CLI, shell and
   TUI all refuse it. An escaped `\*` counts as a real character.

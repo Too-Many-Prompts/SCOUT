@@ -3,7 +3,12 @@
 SCOUT is a read-only tool: every session is switched to a READ ONLY transaction so an
 accidental write fails in the database, not just in our code. Never commit on these
 connections; a commit/rollback ends the read-only transaction (acquire() re-arms it).
+
+Every session also (a) tags itself `module = "SCOUT"` (and `action` = what it is doing) so a DBA
+can find and kill it in V$SESSION, and (b) disables parallel query, so a table declared
+PARALLEL, or automatic DOP, cannot fan one scan out into many PX servers on a shared database.
 """
+import contextlib
 import os
 import threading
 from collections.abc import Iterator
@@ -17,6 +22,10 @@ from scout.config import ConnectionConfig
 
 if TYPE_CHECKING:
     from scout.search import SearchOptions
+
+MODULE = "SCOUT"  # V$SESSION.MODULE of every session we open
+ACTION_IDLE = "idle"
+MAX_ACTION_BYTES = 64  # Oracle's V$SESSION.ACTION limit
 
 _init_lock = threading.Lock()
 _client_initialized = False
@@ -38,9 +47,26 @@ def _dsn(cfg: ConnectionConfig) -> str:
     return oracledb.makedsn(cfg.host, cfg.port, service_name=cfg.service_name)
 
 
-def _set_read_only(conn: oracledb.Connection) -> None:
+def _prepare(conn: oracledb.Connection) -> None:
+    """Make a session safe to point at a shared database: READ ONLY, no parallel query, tagged.
+    ALTER SESSION needs no privilege beyond CREATE SESSION and is not DML."""
+    conn.module = MODULE
+    conn.action = ACTION_IDLE
     with conn.cursor() as cur:
         cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("ALTER SESSION DISABLE PARALLEL QUERY")
+
+
+def set_action(conn: oracledb.Connection, action: str) -> None:
+    """Say what this session is doing (shown as V$SESSION.ACTION; sent with the next call)."""
+    conn.action = action.encode()[:MAX_ACTION_BYTES].decode(errors="ignore")
+
+
+def reset_call_timeout(conn: oracledb.Connection) -> None:
+    """Clear call_timeout before a connection goes back to the pool. A connection that died on
+    that very timeout cannot be reset; that must not replace the timeout the caller is reporting."""
+    with contextlib.suppress(oracledb.Error):
+        conn.call_timeout = 0
 
 
 def connect(cfg: ConnectionConfig, read_only: bool = True) -> oracledb.Connection:
@@ -48,7 +74,9 @@ def connect(cfg: ConnectionConfig, read_only: bool = True) -> oracledb.Connectio
     init_client()
     conn = oracledb.connect(user=cfg.user, password=cfg.password, dsn=_dsn(cfg))
     if read_only:
-        _set_read_only(conn)
+        _prepare(conn)
+    else:
+        conn.module = MODULE
     return conn
 
 
@@ -65,11 +93,13 @@ def acquire(pool: oracledb.ConnectionPool) -> Iterator[oracledb.Connection]:
     """Borrow a connection in a READ ONLY transaction; ended and returned on exit."""
     conn = pool.acquire()
     try:
-        _set_read_only(conn)
+        _prepare(conn)
         yield conn
     finally:
         try:
-            conn.rollback()  # ends the read-only transaction; nothing to lose
+            with contextlib.suppress(oracledb.Error):  # a connection that died on a timeout
+                conn.action = ACTION_IDLE
+                conn.rollback()  # ends the read-only transaction; nothing to lose
         finally:
             pool.release(conn)
 

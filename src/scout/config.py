@@ -1,6 +1,6 @@
 """Connection and runtime defaults. Credentials are never defaulted: callers must prompt."""
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 DEFAULT_HOST = "localhost"
@@ -19,7 +19,7 @@ class ConnectionConfig:
     port: int = DEFAULT_PORT
     service_name: str = DEFAULT_SERVICE_NAME
     user: str | None = None
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)  # never in repr, logs or tracebacks
 
     def with_overrides(self, **overrides) -> "ConnectionConfig":
         """Return a copy with every override that is not None applied."""

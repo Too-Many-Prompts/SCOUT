@@ -232,3 +232,19 @@ def test_snippet_regex_captures_the_proximity_span_in_whole_word_mode():
 
     for text in ("albert einstein", "einstein, albert", "x albert y einstein", "alberts einstein"):  # same matches
         assert bool(re.search(py(pat), text, re.I)) == bool(re.search(py(build_regex(o)[0]), text, re.I))
+
+
+def test_wildcard_stars_are_capped():
+    import pytest
+
+    from scout.pattern import MAX_STARS, build_regex
+    from scout.search import SearchOptions
+
+    build_regex(SearchOptions(terms=("a*" * MAX_STARS + "b",)))  # at the limit
+    with pytest.raises(ValueError, match="Too many"):
+        build_regex(SearchOptions(terms=("a*" * (MAX_STARS + 1) + "b",)))
+    with pytest.raises(ValueError, match="Too many"):  # stars of all words in a phrase add up
+        build_regex(SearchOptions(terms=("a*b*", "c*d*")))
+    with pytest.raises(ValueError, match="Too many"):  # both proximity terms count
+        build_regex(SearchOptions(terms=("a*b*", "c*d*"), near=3))
+    build_regex(SearchOptions(terms=("a\\*" * 10 + "b",)))  # escaped stars are literals
