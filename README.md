@@ -165,7 +165,7 @@ pytest -m integration       # tests against the test database
 pytest -m bench             # benchmark; needs the datasets from python -m tests.bench.load / tests.bench.clobs
 ```
 
-`CLAUDE.md` describes the design constraints and the exact search rules. The design notes and benchmark results are in `docs/superpowers/`.
+`CLAUDE.md` describes the design constraints and the exact search rules.
 
 ## Limitations
 
