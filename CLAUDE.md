@@ -15,7 +15,7 @@ snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-sn
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`), and the TUI whole-row sheet (`search.fetch_row`
 by rowid; TUI only, see "Front-end conventions"). Not implemented yet: any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 736 tests passed with the database up before the production-safety changes (they add about 15 more; run `pytest -m integration` to confirm) (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 745 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
