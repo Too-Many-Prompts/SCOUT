@@ -12,22 +12,36 @@ SCOUT looks through every string column you can see, shows which columns contain
 - Searches columns in parallel, shows live progress, and can be cancelled with Ctrl+C (CLI) or Esc (TUI). Locate-mode queries stop after 300 seconds by default.
 - Exports results to CSV. A locate-mode file has a `complete` column so examples are never mistaken for every hit.
 - Lists columns that could not be searched instead of stopping.
+- Shows a snippet around each hit. In the terminal UI, Enter on a hit opens the full value and `r` opens the whole row behind it.
+- Is gentle on a production database: sessions are tagged `SCOUT` in `V$SESSION`, parallel query is switched off, and external tables are skipped unless you pass `--include-external`.
 
 ## Requirements
 
 - Python 3.10 or newer
-- Oracle Instant Client. SCOUT uses python-oracledb in thick mode and finds the client through `ldconfig`, or set `SCOUT_ORACLE_CLIENT_LIB_DIR`.
+- Oracle Database 19 or later to search
+- Oracle Instant Client (Basic or Basic Light, 19 or later). SCOUT uses python-oracledb in thick mode and finds the client through `ldconfig`, or set `SCOUT_ORACLE_CLIENT_LIB_DIR` to the Instant Client folder.
 - An Oracle account with `SELECT` on the tables you want to search
+- Docker with the compose plugin, only if you want the local test database
 
 ## Install
 
 ```bash
+git clone <this repository's URL> scout && cd scout
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
 This installs the `scout` command. Leave off `[dev]` if you don't need the test tools.
 
+If Instant Client is not on the library path, point SCOUT at it:
+
+```bash
+export SCOUT_ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_23_5   # example path
+```
+
 ## Quick start
+
+You need a reachable Oracle database and an account that can `SELECT`. To try SCOUT without one, set up the [local test database](#local-test-database) first; the examples below use it.
 
 Run `scout` to log in once and search interactively:
 
@@ -42,13 +56,11 @@ Schema to search (comma-separated, blank = all visible): SCOUT_HR
 Connected as scout_reader@localhost:1521/FREEPDB1; searching SCOUT_HR.
 Type 'help' for commands, 'exit' to quit.
 scout> search albert
-SCOUT_HR.EMPLOYEES.NOTES    Talbert moved to Albertson Rd
-SCOUT_HR.EMPLOYEES.BIO      Albert Einstein fan
-2 match(es) in 140 column(s)
+SCOUT_HR.EMPLOYEES.NOTES    Albert met Mr Albertson (+more)
+SCOUT_HR.EMPLOYEES.NOTES    Gilbert and Talbert
+SCOUT_HR.EMPLOYEES.NOTES    Albertina
 Where it was found:
-  SCOUT_HR.EMPLOYEES.NOTES     5 example(s) (more available)
-      every hit: more SCOUT_HR.EMPLOYEES.NOTES
-  SCOUT_HR.EMPLOYEES.BIO       2 example(s)
+  SCOUT_HR.EMPLOYEES.NOTES     3 example(s)
 scout> more SCOUT_HR.EMPLOYEES.NOTES
 ```
 
@@ -114,23 +126,51 @@ Your user name and password are never read from a file or defaulted. SCOUT alway
 
 Select a column in "Where it was found" and choose "Show all hits" to list every hit in it.
 
+## Local test database
+
+The integration tests, and the examples above, run against a throwaway Oracle Free container filled with synthetic data (`tests/db/seed.sql`). Nothing in it is real.
+
+1. Create your `.env` and choose two passwords. `.env` is git-ignored; never commit it.
+
+   ```bash
+   cp .env.example .env
+   # edit .env: set SCOUT_TEST_DB_PASSWORD (the SYSTEM account's password)
+   #            and SCOUT_TEST_READER_PASSWORD (the low-privilege scout_reader account)
+   ```
+
+2. Start the container. The first start downloads `gvenzl/oracle-free` (about 1 GB), creates the database and loads the seed; allow a few minutes. `--wait` returns when the database is healthy.
+
+   ```bash
+   scripts/db.sh up
+   ```
+
+3. Check it, then run the tests:
+
+   ```bash
+   scout        # log in as scout_reader, service FREEPDB1, schema SCOUT_HR
+   pytest -m integration
+   ```
+
+Day to day: `scripts/db.sh down` stops it and keeps the data, `scripts/db.sh logs` follows the log, and `scripts/db.sh reset` wipes the data volume and reseeds. The seed only runs on a fresh volume.
+
+Already have an Oracle 19+ database you may write to? Skip Docker, point the `SCOUT_TEST_DB_*` variables in `.env` at it, and load the seed over a normal connection with `python -m tests.db.load_seed`. This drops and recreates the `SCOUT_*` users, so use a scratch database.
+
+The tests skip, rather than fail, when the database is unreachable or the passwords are unset.
+
 ## Development
 
 ```bash
 pytest                      # unit tests, no database needed
-scripts/db.sh up            # test Oracle in Docker (gvenzl/oracle-free), seeded on first start
-cp .env.example .env        # then set the passwords
-pytest -m integration       # tests against that database
-pytest -m bench             # benchmark; needs the dataset from python -m tests.bench.load
+pytest -m integration       # tests against the test database
+pytest -m bench             # benchmark; needs the datasets from python -m tests.bench.load / tests.bench.clobs
 ```
-
-`scripts/db.sh` also takes `down`, `reset` (wipes the data) and `logs`.
 
 `CLAUDE.md` describes the design constraints and the exact search rules. The design notes and benchmark results are in `docs/superpowers/`.
 
 ## Limitations
 
 - Matching is always a `REGEXP_LIKE` scan. Oracle Text indexes are not used yet.
-- Fetching the whole row behind a hit is not implemented yet.
+- The whole-row view is in the terminal UI only. In the CLI, the CSV `sql_query` column gives a `SELECT` by rowid to paste into your SQL client.
+- A search may contain at most 3 `*` wildcards.
 - Oracle limits a search pattern to 512 bytes.
 - A table that is being altered can't be read for a second after the change, so its columns may show up in the skipped list.
