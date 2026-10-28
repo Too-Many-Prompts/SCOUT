@@ -300,11 +300,18 @@ def _search_one_column(
         )
 
 
+def _show_warnings() -> None:
+    for text in db.take_warnings():
+        typer.secho(f"Warning: {text}", fg=typer.colors.YELLOW, err=True)
+
+
 def _open_session(cfg: ConnectionConfig, schemas: tuple[str, ...], threads: int) -> db.Session:
     try:
-        return db.open_session(cfg, schemas, threads)
+        session = db.open_session(cfg, schemas, threads)
     except oracledb.Error as exc:
         raise _db_failed(exc) from exc
+    _show_warnings()
+    return session
 
 
 @dataclass
@@ -362,6 +369,7 @@ def _locate(cfg: ConnectionConfig, opts: SearchOptions, pool: oracledb.Connectio
         raise _db_failed(exc) from exc
     if token.cancelled:  # the interrupt reached the database but Python never saw the signal
         raise _cancelled(len(run.found))
+    _show_warnings()  # a one-shot search opens its own pool, so its notices appear here
     return run
 
 

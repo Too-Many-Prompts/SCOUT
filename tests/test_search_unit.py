@@ -415,3 +415,44 @@ def test_row_lookups_are_bounded_and_a_timeout_is_explained():
     with pytest.raises(ColumnTimeout, match="60"):
         fetch_detail(conn, m, SearchOptions(terms=("v",)))
     assert seen == [60000, 0]  # armed, then cleared for the pool
+
+
+def _denied_alter_session(code="ORA-01031: insufficient privileges"):
+    import oracledb
+
+    conn, cur = _session_conn()
+
+    def execute(sql, *a, **kw):
+        if sql.startswith("ALTER SESSION"):
+            raise oracledb.DatabaseError(code)
+
+    cur.execute.side_effect = execute
+    pool = MagicMock()
+    pool.acquire.return_value = conn
+    return conn, pool
+
+
+def test_a_locked_down_account_warns_once_and_carries_on(monkeypatch):
+    monkeypatch.setattr(db, "_warned", set())
+    db.take_warnings()
+    conn, pool = _denied_alter_session()
+    with db.acquire(pool):
+        pass
+    with db.acquire(pool):  # a second session does not repeat the notice
+        pass
+    assert db.take_warnings() == [db.PARALLEL_WARNING]
+    assert db.take_warnings() == []
+    assert pool.release.call_count == 2
+
+
+def test_other_errors_from_alter_session_still_fail(monkeypatch):
+    import oracledb
+    import pytest
+
+    monkeypatch.setattr(db, "_warned", set())
+    db.take_warnings()
+    conn, pool = _denied_alter_session("ORA-00604: error occurred at recursive SQL level 1")
+    with pytest.raises(oracledb.DatabaseError, match="ORA-00604"):
+        with db.acquire(pool):
+            pass
+    assert db.take_warnings() == []

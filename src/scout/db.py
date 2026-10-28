@@ -10,6 +10,7 @@ PARALLEL, or automatic DOP, cannot fan one scan out into many PX servers on a sh
 """
 import contextlib
 import os
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -47,14 +48,52 @@ def _dsn(cfg: ConnectionConfig) -> str:
     return oracledb.makedsn(cfg.host, cfg.port, service_name=cfg.service_name)
 
 
+PARALLEL_WARNING = (
+    "Could not disable parallel query on this account (ORA-01031: insufficient privileges). "
+    "Searches continue, but a table declared PARALLEL may use extra parallel servers on the database."
+)
+_warnings: list[str] = []
+_warned: set[str] = set()
+_warn_lock = threading.Lock()
+
+
+def _warn(message: str) -> None:
+    """Remember a non-fatal notice for the front end, once per process (see take_warnings)."""
+    with _warn_lock:
+        if message not in _warned:
+            _warned.add(message)
+            _warnings.append(message)
+
+
+def take_warnings() -> list[str]:
+    """Notices raised since the last call (each is raised only once per process); front ends show them."""
+    with _warn_lock:
+        taken, _warnings[:] = list(_warnings), []
+    return taken
+
+
+def _error_code(exc: BaseException) -> str:
+    code = getattr(exc.args[0], "full_code", None) if exc.args else None
+    if code:
+        return str(code)
+    m = re.search(r"\b(ORA-\d{5}|DPY-\d{4})", str(exc))
+    return m.group(1) if m else ""
+
+
 def _prepare(conn: oracledb.Connection) -> None:
     """Make a session safe to point at a shared database: READ ONLY, no parallel query, tagged.
-    ALTER SESSION needs no privilege beyond CREATE SESSION and is not DML."""
+    ALTER SESSION is not DML and normally needs no privilege beyond CREATE SESSION; if an account is
+    locked down (ORA-01031) the session still works and a warning is recorded (take_warnings)."""
     conn.module = MODULE
     conn.action = ACTION_IDLE
     with conn.cursor() as cur:
         cur.execute("SET TRANSACTION READ ONLY")
-        cur.execute("ALTER SESSION DISABLE PARALLEL QUERY")
+        try:
+            cur.execute("ALTER SESSION DISABLE PARALLEL QUERY")
+        except oracledb.DatabaseError as exc:
+            if _error_code(exc) != "ORA-01031":  # anything but "not allowed" is a real problem
+                raise
+            _warn(PARALLEL_WARNING)  # a locked-down account: carry on, but say so
 
 
 def set_action(conn: oracledb.Connection, action: str) -> None:

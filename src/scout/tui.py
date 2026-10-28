@@ -443,6 +443,8 @@ class ScoutApp(App):
         self.pop_screen()
         self.query_one("#terms", Input).focus()
         self._status("Connected. Enter a search term.")
+        for text in db.take_warnings():
+            self.notify(text, title="Warning", severity="warning", timeout=15)
 
     def action_logout(self) -> None:
         """Back to the login screen: stop any search, close the pool, forget the password."""

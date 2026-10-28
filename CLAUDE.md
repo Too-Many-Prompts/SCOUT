@@ -15,7 +15,7 @@ snippets with a TUI detail window (design: `docs/superpowers/specs/2026-10-27-sn
 results in `docs/superpowers/plans/2026-10-25-locate-first-search-bench.md`), and the TUI whole-row sheet (`search.fetch_row`
 by rowid; TUI only, see "Front-end conventions"). Not implemented yet: any use of Oracle Text indexes for
 matching. Stubs still in the tree should raise `NotImplementedError` and have strict-xfail tests.
-Status: 745 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
+Status: 747 tests pass with the database up (integration tests run once per scan mode), none xfail, plus 8 `bench` tests run separately (`pytest -m bench`, needs the generated datasets; the large-CLOB ones take about 4 minutes). The Docker compose path (`scripts/db.sh`,
 `docker-compose.yml`, `tests/db/init/01_seed.sh`) has been run end to end and works.
 
 ## Search semantics (the contract the tests in `tests/db/expected.py` encode)
@@ -39,7 +39,8 @@ Status: 745 tests pass with the database up (integration tests run once per scan
   open-ended repeat and several make Oracle's backtracking regex burn CPU on long values. Refused by `build_regex`.
 - **Production safety of the session itself:** every session sets `module = "SCOUT"` (and `action` = the table being
   scanned) so a DBA can find it in `V$SESSION`, and runs `ALTER SESSION DISABLE PARALLEL QUERY` (a table declared
-  PARALLEL must not fan a scan out into PX servers). **External tables are skipped** (they read files on the DB
+  PARALLEL must not fan a scan out into PX servers; if the account is not allowed to (ORA-01031) the session still works and
+  `db.take_warnings()` yields a one-time notice, shown by the CLI on stderr and as a TUI toast; any other error still fails). **External tables are skipped** (they read files on the DB
   server, possibly running a PREPROCESSOR) unless `SearchOptions.include_external` / CLI `--include-external`.
   **Oracle 19 or later** is the supported floor (an ORA-00904 from discovery says so). `fetch_detail` / `fetch_row`
   run with a 60 s `call_timeout` (`DETAIL_TIMEOUT`); resetting `call_timeout` on a connection that died on a
